@@ -40,3 +40,13 @@ app.use(['/api/flights', '/flights'], flightRoutes);
 app.use(['/api/challenges', '/challenges'], challengeRoutes);
 app.use(['/api/inventory', '/inventory'], inventoryRoutes);
 
+// Global error handler so serverless function never unceremoniously crashes
+app.use((err: any, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+  console.error('[API Error]:', err);
+  res.status(err?.status || 500).json({
+    status: 'error',
+    error: err?.message || 'Internal Server Error',
+  });
+});
+
+
