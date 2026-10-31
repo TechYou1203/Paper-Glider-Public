@@ -52,6 +52,7 @@ import {
   isServerOnline,
   onServerStatusChange,
   reconnectServer,
+  reconnectServerWithDetails,
   startFlight as apiStartFlight,
   submitFlight as apiSubmitFlight,
   unlockSkin as apiUnlockSkin,
@@ -852,7 +853,13 @@ export default function App() {
     } catch {}
 
     // Synchronize pilot callsign with Neon database
-    initAuth(user.username).catch(() => {});
+    initAuth(user.username)
+      .then((player) => {
+        if (player) {
+          setIsOnline(true);
+        }
+      })
+      .catch(() => {});
   };
 
   const handleContinueAsGuest = () => {
@@ -869,12 +876,27 @@ export default function App() {
     setShowAuthModal(false);
   };
 
-  const handleReconnect = useCallback(async () => {
+  const handleReconnect = useCallback(async (): Promise<{ success: boolean; message: string }> => {
     setIsConnecting(true);
     try {
-      const player = await reconnectServer(currentUser?.username || userStats.callsign);
-      if (player) {
+      const result = await reconnectServerWithDetails(currentUser?.username || userStats.callsign);
+      if (result.success && result.player) {
         setIsOnline(true);
+        const player = result.player;
+        setUserStats((prev) => {
+          const next = {
+            ...prev,
+            callsign: player.callsign || prev.callsign,
+            paperclips: Math.max(prev.paperclips, player.paperclips || 0),
+            unlockedSkins: Array.from(new Set([...prev.unlockedSkins, ...(player.unlockedSkins || [])])),
+            selectedSkin: player.equippedSkin || prev.selectedSkin,
+          };
+          if (currentUser) {
+            saveUserStats(next);
+          }
+          return next;
+        });
+
         const remoteLb = await apiFetchLeaderboard(100);
         if (remoteLb && remoteLb.length > 0) {
           const today = getTodayDateString();
@@ -890,15 +912,22 @@ export default function App() {
           }));
           setLeaderboard(mapped);
         }
+
         const remoteChallenges = await apiFetchChallenges();
         if (remoteChallenges && remoteChallenges.length > 0) {
           setChallenges(remoteChallenges);
         }
+
+        return { success: true, message: result.message };
+      } else {
+        return { success: false, message: result.message };
       }
+    } catch (err: any) {
+      return { success: false, message: err?.message || 'Connection attempt failed. Please check network.' };
     } finally {
       setIsConnecting(false);
     }
-  }, [currentUser?.username, userStats.callsign]);
+  }, [currentUser, userStats.callsign]);
 
   const handleLogout = async () => {
     await logoutUser();

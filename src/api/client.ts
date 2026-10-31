@@ -46,7 +46,7 @@ function updateServerStatus(online: boolean) {
 
 // ─── Helpers ────────────────────────────────────────────────
 
-function getToken(): string | null {
+export function getToken(): string | null {
   if (cachedToken) return cachedToken;
   if (typeof localStorage !== 'undefined') {
     cachedToken = localStorage.getItem(TOKEN_KEY);
@@ -54,10 +54,17 @@ function getToken(): string | null {
   return cachedToken;
 }
 
-function setToken(token: string) {
+export function setToken(token: string) {
   cachedToken = token;
   if (typeof localStorage !== 'undefined') {
     localStorage.setItem(TOKEN_KEY, token);
+  }
+}
+
+export function clearToken() {
+  cachedToken = null;
+  if (typeof localStorage !== 'undefined') {
+    localStorage.removeItem(TOKEN_KEY);
   }
 }
 
@@ -80,6 +87,9 @@ async function apiFetch<T>(
       headers,
     });
     if (!res.ok) {
+      if (res.status === 401) {
+        clearToken();
+      }
       console.warn(`API ${path} returned ${res.status}`);
       return null;
     }
@@ -93,6 +103,13 @@ async function apiFetch<T>(
 }
 
 // ─── Server Availability ────────────────────────────────────
+
+export interface ServerConnectResult {
+  success: boolean;
+  message: string;
+  databaseStatus?: 'connected' | 'missing_database_url' | 'connecting_or_error' | 'unreachable';
+  player?: ServerPlayer | null;
+}
 
 export async function checkServerHealth(timeoutMs = 9000): Promise<boolean> {
   try {
@@ -109,7 +126,7 @@ export async function checkServerHealth(timeoutMs = 9000): Promise<boolean> {
       console.warn('[Paper Glider] Neon database waking up or encountered error:', data?.dbError);
     }
 
-    const isConnected = Boolean(data?.database === 'connected');
+    const isConnected = Boolean(data?.status === 'ok' && (data?.database === 'connected' || data?.database === undefined));
     updateServerStatus(isConnected);
     return isConnected;
   } catch {
@@ -125,31 +142,127 @@ export function isServerOnline(): boolean {
 // ─── Auth ───────────────────────────────────────────────────
 
 export async function registerGuest(callsign?: string): Promise<ServerPlayer | null> {
-  const data = await apiFetch<{ token: string; player: ServerPlayer }>('/auth/guest', {
-    method: 'POST',
-    body: JSON.stringify({ callsign }),
-  });
-  if (data?.token) {
-    setToken(data.token);
-    updateServerStatus(true);
-    return data.player;
+  try {
+    const res = await fetch(`${API_BASE}/auth/guest`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ callsign }),
+    });
+    if (!res.ok) return null;
+    const data = await res.json().catch(() => null);
+    if (data?.token) {
+      setToken(data.token);
+      updateServerStatus(true);
+      return data.player;
+    }
+    return null;
+  } catch {
+    return null;
   }
-  return null;
 }
 
 export async function loginWithToken(): Promise<ServerPlayer | null> {
   const token = getToken();
   if (!token) return null;
 
-  const data = await apiFetch<{ player: ServerPlayer }>('/auth/login', {
-    method: 'POST',
-    body: JSON.stringify({ token }),
-  });
-  if (data?.player) {
-    updateServerStatus(true);
-    return data.player;
+  try {
+    const res = await fetch(`${API_BASE}/auth/login`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({ token }),
+    });
+    if (res.status === 401 || !res.ok) {
+      clearToken();
+      return null;
+    }
+    const data = await res.json().catch(() => null);
+    if (data?.player) {
+      updateServerStatus(true);
+      return data.player;
+    }
+    return null;
+  } catch {
+    return null;
   }
-  return null;
+}
+
+/**
+ * Re-trigger server connection and auth with detailed feedback for users and UI.
+ */
+export async function reconnectServerWithDetails(callsign?: string): Promise<ServerConnectResult> {
+  let data: any = null;
+  try {
+    const res = await fetch(`${API_BASE}/health`, { signal: AbortSignal.timeout(9000) });
+    if (!res.ok) {
+      updateServerStatus(false);
+      return {
+        success: false,
+        databaseStatus: 'unreachable',
+        message: `API returned HTTP ${res.status}. Serverless API is not ready.`,
+      };
+    }
+    data = await res.json().catch(() => null);
+  } catch (err: any) {
+    updateServerStatus(false);
+    return {
+      success: false,
+      databaseStatus: 'unreachable',
+      message: 'Cannot reach backend server. Please verify your internet connection and Vercel deployment.',
+    };
+  }
+
+  if (data?.database === 'missing_database_url') {
+    updateServerStatus(false);
+    return {
+      success: false,
+      databaseStatus: 'missing_database_url',
+      message: 'DATABASE_URL is not configured in Vercel. Please add DATABASE_URL in Vercel Settings → Environment Variables.',
+    };
+  }
+
+  if (data?.database === 'connecting_or_error') {
+    updateServerStatus(false);
+    return {
+      success: false,
+      databaseStatus: 'connecting_or_error',
+      message: `Neon DB is waking up (${data?.dbError || 'cold start'}). Please retry in 5 seconds.`,
+    };
+  }
+
+  // Neon DB is connected or reachable
+  let player = await loginWithToken();
+  if (player) {
+    updateServerStatus(true);
+    return {
+      success: true,
+      databaseStatus: 'connected',
+      message: 'Connected to Neon DB! Cloud flight verification active.',
+      player,
+    };
+  }
+
+  // Token was absent or expired; register/sync with pilot's callsign
+  clearToken();
+  player = await registerGuest(callsign);
+  if (player) {
+    updateServerStatus(true);
+    return {
+      success: true,
+      databaseStatus: 'connected',
+      message: 'Connected to Neon DB! Cloud flight verification active.',
+      player,
+    };
+  }
+
+  updateServerStatus(false);
+  return {
+    success: false,
+    databaseStatus: 'connected',
+    message: 'Neon DB is online, but creating player session failed. Please retry.',
+  };
 }
 
 /**
@@ -157,36 +270,12 @@ export async function loginWithToken(): Promise<ServerPlayer | null> {
  * Includes cold-start resilience for serverless functions & Neon DB sleep states.
  */
 export async function initAuth(callsign?: string): Promise<ServerPlayer | null> {
-  let online = await checkServerHealth(9000);
-
-  // If initial check fails, retry once after 2.5s for cold start wake-up
-  if (!online) {
-    await new Promise((resolve) => setTimeout(resolve, 2500));
-    online = await checkServerHealth(9000);
-  }
-
-  if (!online) {
-    updateServerStatus(false);
-    return null;
-  }
-
-  // Try existing token first
-  let player = await loginWithToken();
-  if (player) {
-    updateServerStatus(true);
-    return player;
-  }
-
-  // Register new guest
-  player = await registerGuest(callsign);
-  if (player) {
-    updateServerStatus(true);
-  }
-  return player;
+  const result = await reconnectServerWithDetails(callsign);
+  return result.player || null;
 }
 
 /**
- * Re-trigger server connection and auth on-demand (e.g., when clicking the status pill).
+ * Re-trigger server connection and auth on-demand.
  */
 export async function reconnectServer(callsign?: string): Promise<ServerPlayer | null> {
   return initAuth(callsign);

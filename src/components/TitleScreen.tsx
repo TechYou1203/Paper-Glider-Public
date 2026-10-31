@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useState, useEffect } from 'react';
 import { Trophy, Calendar, Plane, Volume2, VolumeX, Play, LogIn, LogOut, User as UserIcon } from 'lucide-react';
 import { PilotUser, UserStats } from '../game/types';
 
@@ -10,7 +10,7 @@ interface TitleScreenProps {
   onToggleSound: () => void;
   onOpenAuth: () => void;
   onLogout?: () => void;
-  onReconnect?: () => void;
+  onReconnect?: () => Promise<{ success: boolean; message: string }> | void;
   currentUser: PilotUser | null;
   stats: UserStats;
   isOnline?: boolean;
@@ -31,6 +31,49 @@ export const TitleScreen: React.FC<TitleScreenProps> = ({
   isOnline = false,
   isConnecting = false,
 }) => {
+  const [toast, setToast] = useState<{
+    type: 'warning' | 'info' | 'success';
+    message: string;
+    showLogin?: boolean;
+  } | null>(null);
+
+  useEffect(() => {
+    if (!toast) return;
+    const timer = setTimeout(() => setToast(null), 6000);
+    return () => clearTimeout(timer);
+  }, [toast]);
+
+  const handlePillClick = async () => {
+    // 1. Guest mode check: only signed-in players can connect to Neon DB
+    if (!currentUser) {
+      setToast({
+        type: 'warning',
+        message: 'Guest pilots play in Local Storage mode. Only signed-in pilots can connect to Neon DB.',
+        showLogin: true,
+      });
+      return;
+    }
+
+    // 2. Already online check
+    if (isOnline) {
+      setToast({
+        type: 'info',
+        message: 'Neon DB is online and verified! Your flight scores sync to PostgreSQL.',
+      });
+      return;
+    }
+
+    // 3. Signed-in player reconnecting
+    if (onReconnect) {
+      const result = await onReconnect();
+      if (result) {
+        setToast({
+          type: result.success ? 'success' : 'warning',
+          message: result.message,
+        });
+      }
+    }
+  };
   return (
     <div className="absolute inset-0 flex flex-col justify-between items-center p-3 sm:p-6 z-10 pointer-events-none select-none">
       {/* Top Left Game Logo (Disappears when flight begins) */}
@@ -72,11 +115,19 @@ export const TitleScreen: React.FC<TitleScreenProps> = ({
       {/* Pilot Account Status Pill */}
       <div className="w-full flex justify-between items-center max-w-xl pointer-events-auto mt-1 sm:mt-2 px-1">
         <button
-          onClick={onReconnect}
+          onClick={handlePillClick}
           type="button"
           disabled={isConnecting}
-          title={isOnline ? 'Neon DB Online (Connected to PostgreSQL)' : 'Local Storage Mode — Click to reconnect to Neon DB'}
-          className="flex items-center gap-1.5 bg-[#fffef9] hover:bg-[#f8fafc] border-2 border-[#2d2a26] px-2.5 py-1 rounded-full shadow-[2px_2px_0px_#2d2a26] text-xs font-sketch font-bold cursor-pointer transition-all active:translate-x-0.5 active:translate-y-0.5"
+          title={
+            !currentUser
+              ? 'Local Storage (Guest Mode) — Log in to connect to Neon DB'
+              : isOnline
+              ? 'Neon DB Online (Connected to PostgreSQL)'
+              : 'Local Storage Mode — Click to connect to Neon DB'
+          }
+          className={`flex items-center gap-1.5 bg-[#fffef9] hover:bg-[#f8fafc] border-2 border-[#2d2a26] px-2.5 py-1 rounded-full shadow-[2px_2px_0px_#2d2a26] text-xs font-sketch font-bold transition-all active:translate-x-0.5 active:translate-y-0.5 ${
+            !currentUser ? 'cursor-not-allowed opacity-90' : 'cursor-pointer'
+          }`}
         >
           <span
             className={`w-2 h-2 rounded-full ${
@@ -123,6 +174,46 @@ export const TitleScreen: React.FC<TitleScreenProps> = ({
           )}
         </div>
       </div>
+
+      {/* Dynamic Toast / Warning Notification Banner */}
+      {toast && (
+        <div className="w-full max-w-xl pointer-events-auto mt-2 px-1 transition-all">
+          <div
+            className={`flex items-center justify-between gap-2 px-3 py-2 rounded-xl border-2 border-[#2d2a26] shadow-[3px_3px_0px_#2d2a26] text-xs font-sketch font-bold ${
+              toast.type === 'warning'
+                ? 'bg-[#fef3c7] text-[#92400e]'
+                : toast.type === 'success'
+                ? 'bg-[#dcfce7] text-[#166534]'
+                : 'bg-[#e0f2fe] text-[#075985]'
+            }`}
+          >
+            <div className="flex items-center gap-2 flex-1">
+              <span>{toast.type === 'warning' ? '⚠️' : toast.type === 'success' ? '🟢' : 'ℹ️'}</span>
+              <span className="leading-snug">{toast.message}</span>
+            </div>
+            <div className="flex items-center gap-2 shrink-0">
+              {toast.showLogin && (
+                <button
+                  onClick={() => {
+                    setToast(null);
+                    onOpenAuth();
+                  }}
+                  className="bg-[#2d2a26] text-white px-2.5 py-1 rounded-lg text-xs font-sketch font-bold hover:bg-[#1e293b] active:scale-95 transition-all cursor-pointer"
+                >
+                  Log In
+                </button>
+              )}
+              <button
+                onClick={() => setToast(null)}
+                className="text-[#2d2a26] hover:opacity-70 p-1 text-xs cursor-pointer font-black"
+                title="Dismiss"
+              >
+                ✕
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Main Hero Title Lockup & Emblem */}
       <div className="flex flex-col items-center justify-center text-center my-auto pointer-events-auto max-w-md w-full px-2">
