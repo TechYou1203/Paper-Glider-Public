@@ -10,9 +10,11 @@ interface TitleScreenProps {
   onToggleSound: () => void;
   onOpenAuth: () => void;
   onLogout?: () => void;
+  onReconnect?: () => void;
   currentUser: PilotUser | null;
   stats: UserStats;
   isOnline?: boolean;
+  isConnecting?: boolean;
 }
 
 export const TitleScreen: React.FC<TitleScreenProps> = ({
@@ -23,9 +25,11 @@ export const TitleScreen: React.FC<TitleScreenProps> = ({
   onToggleSound,
   onOpenAuth,
   onLogout,
+  onReconnect,
   currentUser,
   stats,
   isOnline = false,
+  isConnecting = false,
 }) => {
   return (
     <div className="absolute inset-0 flex flex-col justify-between items-center p-3 sm:p-6 z-10 pointer-events-none select-none">
@@ -67,10 +71,26 @@ export const TitleScreen: React.FC<TitleScreenProps> = ({
 
       {/* Pilot Account Status Pill */}
       <div className="w-full flex justify-between items-center max-w-xl pointer-events-auto mt-1 sm:mt-2 px-1">
-        <div className="hidden sm:flex items-center gap-1.5 bg-[#fffef9] border-2 border-[#2d2a26] px-2.5 py-1 rounded-full shadow-[2px_2px_0px_#2d2a26] text-xs font-sketch font-bold">
-          <span className={`w-2 h-2 rounded-full ${isOnline ? 'bg-emerald-500 animate-pulse' : 'bg-amber-400'}`} />
-          <span className="text-[#475569]">{isOnline ? 'Neon DB Online' : 'Local Storage'}</span>
-        </div>
+        <button
+          onClick={onReconnect}
+          type="button"
+          disabled={isConnecting}
+          title={isOnline ? 'Neon DB Online (Connected to PostgreSQL)' : 'Local Storage Mode — Click to reconnect to Neon DB'}
+          className="flex items-center gap-1.5 bg-[#fffef9] hover:bg-[#f8fafc] border-2 border-[#2d2a26] px-2.5 py-1 rounded-full shadow-[2px_2px_0px_#2d2a26] text-xs font-sketch font-bold cursor-pointer transition-all active:translate-x-0.5 active:translate-y-0.5"
+        >
+          <span
+            className={`w-2 h-2 rounded-full ${
+              isConnecting
+                ? 'bg-amber-400 animate-ping'
+                : isOnline
+                ? 'bg-emerald-500 animate-pulse'
+                : 'bg-amber-400'
+            }`}
+          />
+          <span className="text-[#475569]">
+            {isConnecting ? 'Connecting...' : isOnline ? 'Neon DB Online' : 'Local Storage'}
+          </span>
+        </button>
 
         <div className="ml-auto">
           {currentUser ? (

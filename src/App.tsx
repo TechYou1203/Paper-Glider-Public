@@ -50,6 +50,8 @@ import {
   fetchLeaderboard as apiFetchLeaderboard,
   initAuth,
   isServerOnline,
+  onServerStatusChange,
+  reconnectServer,
   startFlight as apiStartFlight,
   submitFlight as apiSubmitFlight,
   unlockSkin as apiUnlockSkin,
@@ -77,7 +79,16 @@ export default function App() {
   const [leaderboard, setLeaderboard] = useState<LeaderboardEntry[]>([]);
   const [challenges, setChallenges] = useState<DailyChallenge[]>([]);
   const [isOnline, setIsOnline] = useState<boolean>(false);
+  const [isConnecting, setIsConnecting] = useState<boolean>(false);
   const [verifiedRank, setVerifiedRank] = useState<number | null>(null);
+
+  // Subscribe to backend status updates
+  useEffect(() => {
+    const unsub = onServerStatusChange((online) => {
+      setIsOnline(online);
+    });
+    return unsub;
+  }, []);
 
   // Authentication State
   const [currentUser, setCurrentUser] = useState<PilotUser | null>(() => getCurrentSession());
@@ -858,6 +869,37 @@ export default function App() {
     setShowAuthModal(false);
   };
 
+  const handleReconnect = useCallback(async () => {
+    setIsConnecting(true);
+    try {
+      const player = await reconnectServer(currentUser?.username || userStats.callsign);
+      if (player) {
+        setIsOnline(true);
+        const remoteLb = await apiFetchLeaderboard(100);
+        if (remoteLb && remoteLb.length > 0) {
+          const today = getTodayDateString();
+          const mapped: LeaderboardEntry[] = remoteLb.map((e) => ({
+            id: `server-${e.rank}`,
+            callsign: e.callsign,
+            score: e.score,
+            clips: e.clips,
+            date: e.achievedAt ? e.achievedAt.split('T')[0] : today,
+            planeSkin: e.skin || 'classic',
+            country: '🌐',
+            isPlayer: e.isPlayer,
+          }));
+          setLeaderboard(mapped);
+        }
+        const remoteChallenges = await apiFetchChallenges();
+        if (remoteChallenges && remoteChallenges.length > 0) {
+          setChallenges(remoteChallenges);
+        }
+      }
+    } finally {
+      setIsConnecting(false);
+    }
+  }, [currentUser?.username, userStats.callsign]);
+
   const handleLogout = async () => {
     await logoutUser();
     setCurrentUser(null);
@@ -891,9 +933,11 @@ export default function App() {
           onToggleSound={handleToggleSound}
           onOpenAuth={() => setShowAuthModal(true)}
           onLogout={handleLogout}
+          onReconnect={handleReconnect}
           currentUser={currentUser}
           stats={userStats}
           isOnline={isOnline}
+          isConnecting={isConnecting}
         />
       )}
 

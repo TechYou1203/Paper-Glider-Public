@@ -18,6 +18,32 @@ const TOKEN_KEY = 'paper_glider_auth_token';
 let cachedToken: string | null = null;
 let serverOnline: boolean | null = null;
 
+type StatusListener = (online: boolean) => void;
+const statusListeners = new Set<StatusListener>();
+
+export function onServerStatusChange(listener: StatusListener): () => void {
+  statusListeners.add(listener);
+  if (serverOnline !== null) {
+    listener(serverOnline);
+  }
+  return () => {
+    statusListeners.delete(listener);
+  };
+}
+
+function updateServerStatus(online: boolean) {
+  if (serverOnline !== online) {
+    serverOnline = online;
+    statusListeners.forEach((listener) => {
+      try {
+        listener(online);
+      } catch (err) {
+        console.error('Error in server status listener:', err);
+      }
+    });
+  }
+}
+
 // ─── Helpers ────────────────────────────────────────────────
 
 function getToken(): string | null {
@@ -42,7 +68,7 @@ async function apiFetch<T>(
   const token = getToken();
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
-    ...(options.headers as Record<string, string> || {}),
+    ...((options.headers as Record<string, string>) || {}),
   };
   if (token) {
     headers['Authorization'] = `Bearer ${token}`;
@@ -57,24 +83,39 @@ async function apiFetch<T>(
       console.warn(`API ${path} returned ${res.status}`);
       return null;
     }
-    serverOnline = true;
+    updateServerStatus(true);
     return (await res.json()) as T;
-  } catch {
-    serverOnline = false;
+  } catch (err) {
+    console.warn(`API fetch error on ${path}:`, err);
+    updateServerStatus(false);
     return null;
   }
 }
 
 // ─── Server Availability ────────────────────────────────────
 
-export async function checkServerHealth(): Promise<boolean> {
+export async function checkServerHealth(timeoutMs = 9000): Promise<boolean> {
   try {
-    const res = await fetch(`${API_BASE}/health`, { signal: AbortSignal.timeout(3000) });
-    serverOnline = res.ok;
+    const res = await fetch(`${API_BASE}/health`, { signal: AbortSignal.timeout(timeoutMs) });
+    if (!res.ok) {
+      updateServerStatus(false);
+      return false;
+    }
+    const data = await res.json().catch(() => null);
+
+    if (data?.database === 'missing_database_url') {
+      console.warn('[Paper Glider] DATABASE_URL is not configured in environment variables. Running in Local Storage mode.');
+    } else if (data?.database === 'connecting_or_error') {
+      console.warn('[Paper Glider] Neon database waking up or encountered error:', data?.dbError);
+    }
+
+    const isConnected = Boolean(data?.database === 'connected');
+    updateServerStatus(isConnected);
+    return isConnected;
   } catch {
-    serverOnline = false;
+    updateServerStatus(false);
+    return false;
   }
-  return serverOnline ?? false;
 }
 
 export function isServerOnline(): boolean {
@@ -90,6 +131,7 @@ export async function registerGuest(callsign?: string): Promise<ServerPlayer | n
   });
   if (data?.token) {
     setToken(data.token);
+    updateServerStatus(true);
     return data.player;
   }
   return null;
@@ -103,23 +145,51 @@ export async function loginWithToken(): Promise<ServerPlayer | null> {
     method: 'POST',
     body: JSON.stringify({ token }),
   });
-  return data?.player ?? null;
+  if (data?.player) {
+    updateServerStatus(true);
+    return data.player;
+  }
+  return null;
 }
 
 /**
  * Initialize auth: try to login with existing token, or register a new guest.
+ * Includes cold-start resilience for serverless functions & Neon DB sleep states.
  */
 export async function initAuth(callsign?: string): Promise<ServerPlayer | null> {
-  const online = await checkServerHealth();
-  if (!online) return null;
+  let online = await checkServerHealth(9000);
+
+  // If initial check fails, retry once after 2.5s for cold start wake-up
+  if (!online) {
+    await new Promise((resolve) => setTimeout(resolve, 2500));
+    online = await checkServerHealth(9000);
+  }
+
+  if (!online) {
+    updateServerStatus(false);
+    return null;
+  }
 
   // Try existing token first
   let player = await loginWithToken();
-  if (player) return player;
+  if (player) {
+    updateServerStatus(true);
+    return player;
+  }
 
   // Register new guest
   player = await registerGuest(callsign);
+  if (player) {
+    updateServerStatus(true);
+  }
   return player;
+}
+
+/**
+ * Re-trigger server connection and auth on-demand (e.g., when clicking the status pill).
+ */
+export async function reconnectServer(callsign?: string): Promise<ServerPlayer | null> {
+  return initAuth(callsign);
 }
 
 // ─── Flights ────────────────────────────────────────────────
@@ -150,19 +220,34 @@ export async function submitFlight(
 export async function fetchLeaderboard(
   limit = 100
 ): Promise<ServerLeaderboardEntry[] | null> {
-  return apiFetch<ServerLeaderboardEntry[]>(`/leaderboard?limit=${limit}`);
+  const data = await apiFetch<{ entries: ServerLeaderboardEntry[] } | ServerLeaderboardEntry[]>(
+    `/leaderboard?limit=${limit}`
+  );
+  if (!data) return null;
+  if (Array.isArray(data)) return data;
+  return data.entries ?? null;
 }
 
 export async function fetchDailyLeaderboard(
   limit = 100
 ): Promise<ServerLeaderboardEntry[] | null> {
-  return apiFetch<ServerLeaderboardEntry[]>(`/leaderboard/daily?limit=${limit}`);
+  const data = await apiFetch<{ entries: ServerLeaderboardEntry[] } | ServerLeaderboardEntry[]>(
+    `/leaderboard/daily?limit=${limit}`
+  );
+  if (!data) return null;
+  if (Array.isArray(data)) return data;
+  return data.entries ?? null;
 }
 
 // ─── Challenges ─────────────────────────────────────────────
 
 export async function fetchDailyChallenges(): Promise<DailyChallenge[] | null> {
-  return apiFetch<DailyChallenge[]>('/challenges/daily');
+  const data = await apiFetch<{ challenges: DailyChallenge[] } | DailyChallenge[]>(
+    '/challenges/daily'
+  );
+  if (!data) return null;
+  if (Array.isArray(data)) return data;
+  return data.challenges ?? null;
 }
 
 export async function claimChallenge(
@@ -179,24 +264,30 @@ export async function unlockSkin(
   skinId: string,
   cost: number
 ): Promise<ServerPlayer | null> {
-  return apiFetch<ServerPlayer>('/inventory/unlock', {
+  const data = await apiFetch<{ player: ServerPlayer } | ServerPlayer>('/inventory/unlock', {
     method: 'POST',
     body: JSON.stringify({ skinId, cost }),
   });
+  if (!data) return null;
+  return 'player' in data ? data.player : data;
 }
 
 export async function equipSkin(skinId: string): Promise<ServerPlayer | null> {
-  return apiFetch<ServerPlayer>('/inventory/equip', {
+  const data = await apiFetch<{ player: ServerPlayer } | ServerPlayer>('/inventory/equip', {
     method: 'PATCH',
     body: JSON.stringify({ skinId }),
   });
+  if (!data) return null;
+  return 'player' in data ? data.player : data;
 }
 
 export async function updateSettings(
   settings: { callsign?: string; soundEnabled?: boolean }
 ): Promise<ServerPlayer | null> {
-  return apiFetch<ServerPlayer>('/inventory/settings', {
+  const data = await apiFetch<{ player: ServerPlayer } | ServerPlayer>('/inventory/settings', {
     method: 'PATCH',
     body: JSON.stringify(settings),
   });
+  if (!data) return null;
+  return 'player' in data ? data.player : data;
 }
