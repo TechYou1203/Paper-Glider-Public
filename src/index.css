@@ -1,0 +1,57 @@
+@import "tailwindcss";
+
+@layer base {
+  :root {
+    --font-notebook: 'Patrick Hand', 'Kalam', cursive;
+    --font-heading: 'Caveat', 'Kalam', cursive;
+  }
+
+  body {
+    user-select: none;
+    -webkit-user-select: none;
+    touch-action: none;
+    -webkit-touch-callout: none;
+    overflow: hidden;
+  }
+}
+
+.font-sketch {
+  font-family: 'Patrick Hand', 'Kalam', cursive;
+}
+
+.font-title {
+  font-family: 'Caveat', cursive;
+}
+
+/* Custom notebook paper lines and grid patterns */
+.notebook-ruled {
+  background-color: #fbf8ef;
+  background-image: 
+    linear-gradient(90deg, transparent 69px, #e87b7b 70px, #e87b7b 71px, transparent 72px),
+    linear-gradient(#dce4ec 1px, transparent 1px);
+  background-size: 100% 100%, 100% 28px;
+}
+
+/* Subtle hand-drawn border effect */
+.sketch-border {
+  border-style: solid;
+  border-width: 2px;
+  border-color: #3e3a35;
+  border-radius: 255px 15px 225px 15px/15px 225px 15px 255px;
+}
+
+.sketch-card {
+  background-color: #fffef9;
+  border: 2px solid #2d2a26;
+  border-radius: 12px;
+  box-shadow: 4px 4px 0px 0px rgba(45, 42, 38, 0.85);
+}
+
+.sketch-card-hover {
+  transition: transform 0.1s ease, box-shadow 0.1s ease;
+}
+
+.sketch-card-hover:active {
+  transform: translate(2px, 2px);
+  box-shadow: 2px 2px 0px 0px rgba(45, 42, 38, 0.85);
+}
