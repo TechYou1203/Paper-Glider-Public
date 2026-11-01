@@ -58,7 +58,6 @@ export const AuthModal: React.FC<AuthModalProps> = ({
   const [verificationCode, setVerificationCode] = useState('');
   const [forgotInput, setForgotInput] = useState('');
   const [confirmEmail, setConfirmEmail] = useState('');
-  const [devCodeHint, setDevCodeHint] = useState<string | null>(null);
 
   // States
   const [loading, setLoading] = useState(false);
@@ -133,7 +132,6 @@ export const AuthModal: React.FC<AuthModalProps> = ({
       } else {
         setVerificationType('signup');
         setVerificationCode('');
-        setDevCodeHint(res.devCode || null);
         setResendCooldown(45);
         setSuccessMessage('Verification code sent to your email! Please check your inbox or spam folder.');
         setTab('verify-code');
@@ -168,7 +166,6 @@ export const AuthModal: React.FC<AuthModalProps> = ({
       } else {
         setVerificationType('login');
         setVerificationCode('');
-        setDevCodeHint(res.devCode || null);
         setResendCooldown(45);
         setSuccessMessage('Login verification code sent! Check your inbox or spam folder.');
         setTab('verify-code');
@@ -246,7 +243,6 @@ export const AuthModal: React.FC<AuthModalProps> = ({
       );
       if (res.success) {
         setResendCooldown(45);
-        setDevCodeHint(res.devCode || null);
         setSuccessMessage('A fresh verification code has been dispatched to your email!');
       } else {
         setErrorMessage(res.error || 'Failed to resend code.');
@@ -588,18 +584,6 @@ export const AuthModal: React.FC<AuthModalProps> = ({
                 </p>
               </div>
             </div>
-
-            {/* Development Simulation Hint (When SMTP credentials are not yet configured) */}
-            {devCodeHint && (
-              <div className="p-2.5 bg-[#e0f2fe] border-2 border-[#0284c7] rounded-xl text-center shadow-[2px_2px_0px_#0284c7]">
-                <p className="font-sketch text-xs font-bold text-[#0369a1]">
-                  🔧 Simulation Mode (No SMTP key): Code is{' '}
-                  <span className="font-mono text-base font-black text-[#0c4a6e] bg-[#bae6fd] px-2 py-0.5 rounded">
-                    {devCodeHint}
-                  </span>
-                </p>
-              </div>
-            )}
 
             {/* 6-Digit Code Input Box */}
             <div>

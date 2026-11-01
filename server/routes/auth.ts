@@ -195,7 +195,7 @@ router.post('/send-verification-code', async (req: Request, res: Response) => {
     `;
 
     // Dispatch the email
-    const emailResult = await sendVerificationEmail({
+    await sendVerificationEmail({
       email: trimmedEmail,
       username: cleanUsername,
       code,
@@ -204,11 +204,9 @@ router.post('/send-verification-code', async (req: Request, res: Response) => {
 
     res.json({
       success: true,
-      message: 'Verification code sent to your email address.',
+      message: 'Verification code sent to your email address. Please check your inbox and Spam folder.',
       email: trimmedEmail,
       username: cleanUsername,
-      simulated: emailResult.simulated,
-      devCode: emailResult.simulated ? code : undefined,
     });
   } catch (error) {
     console.error('Send verification code error:', error);

@@ -333,8 +333,6 @@ export async function sendVerificationCode(
   error?: string;
   email?: string;
   username?: string;
-  simulated?: boolean;
-  devCode?: string;
 }> {
   try {
     const res = await fetch(`${API_BASE}/auth/send-verification-code`, {
@@ -351,8 +349,6 @@ export async function sendVerificationCode(
       message: data.message,
       email: data.email,
       username: data.username,
-      simulated: data.simulated,
-      devCode: data.devCode,
     };
   } catch (err: any) {
     return { success: false, error: err?.message || 'Network error sending verification code.' };

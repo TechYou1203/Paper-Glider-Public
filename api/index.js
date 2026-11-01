@@ -42180,7 +42180,7 @@ router.post("/send-verification-code", async (req, res) => {
       INSERT INTO verification_codes (email, username, code, type, expires_at)
       VALUES (${trimmedEmail}, ${cleanUsername}, ${code}, ${type}, NOW() + INTERVAL '10 minutes')
     `;
-    const emailResult = await sendVerificationEmail({
+    await sendVerificationEmail({
       email: trimmedEmail,
       username: cleanUsername,
       code,
@@ -42188,11 +42188,9 @@ router.post("/send-verification-code", async (req, res) => {
     });
     res.json({
       success: true,
-      message: "Verification code sent to your email address.",
+      message: "Verification code sent to your email address. Please check your inbox and Spam folder.",
       email: trimmedEmail,
-      username: cleanUsername,
-      simulated: emailResult.simulated,
-      devCode: emailResult.simulated ? code : void 0
+      username: cleanUsername
     });
   } catch (error2) {
     console.error("Send verification code error:", error2);
