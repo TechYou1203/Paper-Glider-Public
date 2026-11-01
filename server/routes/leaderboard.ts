@@ -12,7 +12,7 @@ router.get('/', optionalAuth, async (req: AuthenticatedRequest, res: Response) =
     const rows = await sql`
       SELECT id, player_id, callsign, score, clips, skin, achieved_at
       FROM leaderboard
-      ORDER BY score DESC
+      ORDER BY score DESC, clips DESC, achieved_at ASC
       LIMIT ${limit}
     `;
 
@@ -43,7 +43,7 @@ router.get('/daily', optionalAuth, async (req: AuthenticatedRequest, res: Respon
       SELECT id, player_id, callsign, score, clips, skin, achieved_at
       FROM leaderboard
       WHERE achieved_at >= CURRENT_DATE
-      ORDER BY score DESC
+      ORDER BY score DESC, clips DESC, achieved_at ASC
       LIMIT ${limit}
     `;
 

@@ -118,10 +118,10 @@ router.post('/:id/submit', authMiddleware, async (req: AuthenticatedRequest, res
         INSERT INTO leaderboard (player_id, callsign, score, clips, skin, flight_id)
         VALUES (${player.id}, ${player.callsign}, ${verifiedScore}, ${clipsCount}, ${player.equippedSkin}, ${flightId})
       `;
-    } else if (verifiedScore > existingLb[0].score) {
+    } else if (verifiedScore > existingLb[0].score || (verifiedScore === existingLb[0].score && clipsCount > existingLb[0].clips)) {
       await sql`
         UPDATE leaderboard
-        SET score = ${verifiedScore}, clips = ${clipsCount}, skin = ${player.equippedSkin},
+        SET score = ${verifiedScore}, clips = GREATEST(clips, ${clipsCount}), skin = ${player.equippedSkin},
             flight_id = ${flightId}, callsign = ${player.callsign}, achieved_at = NOW()
         WHERE player_id = ${player.id}
       `;

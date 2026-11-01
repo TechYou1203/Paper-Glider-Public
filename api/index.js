@@ -29119,7 +29119,7 @@ router2.get("/", optionalAuth, async (req, res) => {
     const rows = await sql`
       SELECT id, player_id, callsign, score, clips, skin, achieved_at
       FROM leaderboard
-      ORDER BY score DESC
+      ORDER BY score DESC, clips DESC, achieved_at ASC
       LIMIT ${limit}
     `;
     const entries = rows.map((row, index) => ({
@@ -29145,7 +29145,7 @@ router2.get("/daily", optionalAuth, async (req, res) => {
       SELECT id, player_id, callsign, score, clips, skin, achieved_at
       FROM leaderboard
       WHERE achieved_at >= CURRENT_DATE
-      ORDER BY score DESC
+      ORDER BY score DESC, clips DESC, achieved_at ASC
       LIMIT ${limit}
     `;
     const entries = rows.map((row, index) => ({
@@ -29960,10 +29960,10 @@ router3.post("/:id/submit", authMiddleware, async (req, res) => {
         INSERT INTO leaderboard (player_id, callsign, score, clips, skin, flight_id)
         VALUES (${player.id}, ${player.callsign}, ${verifiedScore}, ${clipsCount}, ${player.equippedSkin}, ${flightId})
       `;
-    } else if (verifiedScore > existingLb[0].score) {
+    } else if (verifiedScore > existingLb[0].score || verifiedScore === existingLb[0].score && clipsCount > existingLb[0].clips) {
       await sql`
         UPDATE leaderboard
-        SET score = ${verifiedScore}, clips = ${clipsCount}, skin = ${player.equippedSkin},
+        SET score = ${verifiedScore}, clips = GREATEST(clips, ${clipsCount}), skin = ${player.equippedSkin},
             flight_id = ${flightId}, callsign = ${player.callsign}, achieved_at = NOW()
         WHERE player_id = ${player.id}
       `;

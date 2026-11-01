@@ -190,6 +190,26 @@ export default function App() {
     setLeaderboard(loadedLb);
 
     const today = getTodayDateString();
+
+    // Fetch official global leaderboard from Neon DB on boot
+    apiFetchLeaderboard(100)
+      .then((remoteLb) => {
+        if (remoteLb) {
+          const mapped: LeaderboardEntry[] = remoteLb.map((e) => ({
+            id: `server-${e.rank}-${e.playerId || e.callsign}`,
+            callsign: e.callsign,
+            score: e.score,
+            clips: e.clips,
+            date: e.achievedAt ? e.achievedAt.split('T')[0] : today,
+            planeSkin: e.skin || 'classic',
+            country: '🌐',
+            isPlayer: e.isPlayer,
+          }));
+          setLeaderboard(mapped);
+        }
+      })
+      .catch(() => {});
+
     const dailyList = generateDailyChallenges(today);
     const updatedChallenges = dailyList.map((c) => ({
       ...c,
@@ -220,22 +240,6 @@ export default function App() {
           }
           return next;
         });
-
-        // Sync leaderboard from server
-        const remoteLb = await apiFetchLeaderboard(100);
-        if (remoteLb && remoteLb.length > 0) {
-          const mapped: LeaderboardEntry[] = remoteLb.map((e) => ({
-            id: `server-${e.rank}`,
-            callsign: e.callsign,
-            score: e.score,
-            clips: e.clips,
-            date: e.achievedAt ? e.achievedAt.split('T')[0] : today,
-            planeSkin: e.skin || 'classic',
-            country: '🌐',
-            isPlayer: e.isPlayer,
-          }));
-          setLeaderboard(mapped);
-        }
 
         // Sync daily challenges
         const remoteChallenges = await apiFetchChallenges();
@@ -925,10 +929,10 @@ export default function App() {
         });
 
         const remoteLb = await apiFetchLeaderboard(100);
-        if (remoteLb && remoteLb.length > 0) {
+        if (remoteLb) {
           const today = getTodayDateString();
           const mapped: LeaderboardEntry[] = remoteLb.map((e) => ({
-            id: `server-${e.rank}`,
+            id: `server-${e.rank}-${e.playerId || e.callsign}`,
             callsign: e.callsign,
             score: e.score,
             clips: e.clips,
@@ -1006,6 +1010,28 @@ export default function App() {
     }
   };
 
+  const handleOpenLeaderboard = () => {
+    setShowLeaderboard(true);
+    apiFetchLeaderboard(100)
+      .then((remoteLb) => {
+        if (remoteLb) {
+          const today = getTodayDateString();
+          const mapped: LeaderboardEntry[] = remoteLb.map((e) => ({
+            id: `server-${e.rank}-${e.playerId || e.callsign}`,
+            callsign: e.callsign,
+            score: e.score,
+            clips: e.clips,
+            date: e.achievedAt ? e.achievedAt.split('T')[0] : today,
+            planeSkin: e.skin || 'classic',
+            country: '🌐',
+            isPlayer: e.isPlayer,
+          }));
+          setLeaderboard(mapped);
+        }
+      })
+      .catch(() => {});
+  };
+
   return (
     <div className="relative w-screen h-screen overflow-hidden bg-[#faf7ed] select-none touch-none">
       <canvas
@@ -1018,7 +1044,7 @@ export default function App() {
       {gameState === 'title' && (
         <TitleScreen
           onStart={startGame}
-          onOpenLeaderboard={() => setShowLeaderboard(true)}
+          onOpenLeaderboard={handleOpenLeaderboard}
           onOpenChallenges={() => setShowChallenges(true)}
           onOpenHangar={() => setShowHangar(true)}
           onToggleSound={handleToggleSound}
@@ -1073,7 +1099,7 @@ export default function App() {
           callsign={userStats.callsign}
           onRestart={startGame}
           onHome={() => setGameState('title')}
-          onOpenLeaderboard={() => setShowLeaderboard(true)}
+          onOpenLeaderboard={handleOpenLeaderboard}
           onOpenChallenges={() => setShowChallenges(true)}
           onUpdateCallsign={handleUpdateCallsign}
           verifiedRank={verifiedRank}
