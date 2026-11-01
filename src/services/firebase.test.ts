@@ -11,6 +11,8 @@ import {
   recoverUsernameByEmail,
   sendPasswordlessLoginLink,
   runWithTimeout,
+  deletePilotAccount,
+  getCurrentSession,
 } from './firebase';
 
 test('auth: username normalization lowercases and trims', () => {
@@ -121,4 +123,27 @@ test('auth: runWithTimeout safeguard prevents infinite freezing', async () => {
 
   assert.equal(result, fallback);
   assert.ok(elapsed >= 140 && elapsed < 500, `Expected ~150ms timeout, took ${elapsed}ms`);
+});
+
+test('auth: deletePilotAccount permanently removes pilot user and frees up callsign', async () => {
+  const username = 'WipePilot_' + Math.random().toString(36).substring(2, 8);
+  const password = 'Password456!';
+  const reg = await registerWithUsername(username, password);
+  assert.equal(reg.success, true);
+  assert.ok(reg.user);
+
+  // Callsign is now taken
+  const availableBefore = await checkUsernameAvailable(username);
+  assert.equal(availableBefore, false);
+
+  // Perform permanent deletion
+  const delRes = await deletePilotAccount(reg.user!);
+  assert.equal(delRes.success, true);
+
+  // Session is cleared
+  assert.equal(getCurrentSession(), null);
+
+  // Callsign is now available again for registration
+  const availableAfter = await checkUsernameAvailable(username);
+  assert.equal(availableAfter, true);
 });

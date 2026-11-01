@@ -25,6 +25,7 @@ import {
   sendSignInLinkToEmail,
   isSignInWithEmailLink,
   signInWithEmailLink,
+  deleteUser,
   type Auth,
   type User,
 } from 'firebase/auth';
@@ -34,6 +35,7 @@ import {
   getDoc,
   setDoc,
   updateDoc,
+  deleteDoc,
   collection,
   query,
   where,
@@ -962,6 +964,66 @@ export async function logoutUser(): Promise<void> {
     } catch {}
   }
   clearCurrentSession();
+}
+
+/**
+ * Permanently delete pilot account from Firebase Auth, Firestore, and Local Registry.
+ */
+export async function deletePilotAccount(user: PilotUser): Promise<{ success: boolean; error?: string }> {
+  let errorMsg: string | undefined;
+
+  // 1. Delete from Firebase Authentication if authenticated
+  if (auth && auth.currentUser) {
+    try {
+      await deleteUser(auth.currentUser);
+    } catch (err: any) {
+      console.warn('Firebase Auth user deletion warning:', err);
+      if (err?.code === 'auth/requires-recent-login') {
+        errorMsg = 'Please log out and log in again before deleting your account for security verification.';
+      }
+    }
+  }
+
+  // 2. Delete from Firestore (users & usernames)
+  if (db && user.uid && !user.uid.startsWith('local-')) {
+    try {
+      await runWithTimeout(
+        async () => {
+          const userRef = doc(db!, 'users', user.uid);
+          const usernameRef = doc(db!, 'usernames', user.username.trim().toLowerCase());
+          await Promise.allSettled([
+            deleteDoc(userRef),
+            deleteDoc(usernameRef),
+          ]);
+        },
+        5000,
+        null
+      );
+    } catch (err) {
+      console.warn('Firestore document deletion warning:', err);
+    }
+  }
+
+  // 3. Delete from local registry fallback
+  try {
+    const localUsers = getLocalUsers();
+    const norm = normalizeUsername(user.username);
+    if (localUsers[norm]) {
+      delete localUsers[norm];
+    }
+    for (const key of Object.keys(localUsers)) {
+      if (localUsers[key].uid === user.uid) {
+        delete localUsers[key];
+      }
+    }
+    saveLocalUsers(localUsers);
+    safeRemoveItem(`paper_glider_cloud_stats_${user.uid}`);
+  } catch {}
+
+  // 4. Clear current session
+  clearCurrentSession();
+
+  return { success: !errorMsg, error: errorMsg };
 }
 
 /**

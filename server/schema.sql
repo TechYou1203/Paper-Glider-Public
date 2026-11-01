@@ -3,6 +3,7 @@ CREATE EXTENSION IF NOT EXISTS "pgcrypto";
 CREATE TABLE IF NOT EXISTS players (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   guest_token VARCHAR(64) UNIQUE NOT NULL,
+  firebase_uid VARCHAR(128) UNIQUE,
   callsign VARCHAR(32) NOT NULL,
   equipped_skin VARCHAR(32) DEFAULT 'classic',
   paperclips INTEGER DEFAULT 0,
@@ -11,6 +12,8 @@ CREATE TABLE IF NOT EXISTS players (
   created_at TIMESTAMPTZ DEFAULT NOW(),
   updated_at TIMESTAMPTZ DEFAULT NOW()
 );
+
+ALTER TABLE players ADD COLUMN IF NOT EXISTS firebase_uid VARCHAR(128) UNIQUE;
 
 CREATE TABLE IF NOT EXISTS flights (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -52,3 +55,4 @@ CREATE INDEX IF NOT EXISTS idx_leaderboard_date ON leaderboard(achieved_at DESC)
 CREATE INDEX IF NOT EXISTS idx_flights_player ON flights(player_id);
 CREATE INDEX IF NOT EXISTS idx_daily_player_date ON daily_challenge_progress(player_id, challenge_date);
 CREATE INDEX IF NOT EXISTS idx_players_token ON players(guest_token);
+CREATE INDEX IF NOT EXISTS idx_players_firebase_uid ON players(firebase_uid);

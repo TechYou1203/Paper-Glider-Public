@@ -10,6 +10,7 @@ interface TitleScreenProps {
   onToggleSound: () => void;
   onOpenAuth: () => void;
   onLogout?: () => void;
+  onOpenAccount?: () => void;
   onReconnect?: () => Promise<{ success: boolean; message: string }> | void;
   currentUser: PilotUser | null;
   stats: UserStats;
@@ -25,6 +26,7 @@ export const TitleScreen: React.FC<TitleScreenProps> = ({
   onToggleSound,
   onOpenAuth,
   onLogout,
+  onOpenAccount,
   onReconnect,
   currentUser,
   stats,
@@ -146,10 +148,26 @@ export const TitleScreen: React.FC<TitleScreenProps> = ({
         <div className="ml-auto">
           {currentUser ? (
             <div className="flex items-center gap-2 bg-[#fffef9] border-2 border-[#2d2a26] px-3 py-1 rounded-full shadow-[2px_2px_0px_#2d2a26]">
-              <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
-              <span className="font-sketch text-xs sm:text-sm font-bold text-[#1e293b]">
-                Pilot: <span className="text-[#0284c7] font-black">{currentUser.username}</span>
-              </span>
+              <button
+                onClick={onOpenAccount}
+                title="View Pilot Dossier & Account Settings"
+                className="flex items-center gap-1.5 hover:opacity-80 cursor-pointer text-left transition-opacity"
+              >
+                <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
+                <span className="font-sketch text-xs sm:text-sm font-bold text-[#1e293b]">
+                  Pilot: <span className="text-[#0284c7] font-black underline decoration-dotted">{currentUser.username}</span>
+                </span>
+              </button>
+              {onOpenAccount && (
+                <button
+                  onClick={onOpenAccount}
+                  title="Account Dossier & Security"
+                  className="font-sketch text-xs font-bold bg-[#f1f5f9] hover:bg-[#e2e8f0] border border-[#2d2a26] px-2 py-0.5 rounded-full cursor-pointer ml-0.5 text-[#1e293b] flex items-center gap-1 active:scale-95 transition-all"
+                >
+                  <UserIcon size={12} />
+                  <span>Dossier</span>
+                </button>
+              )}
               {onLogout && (
                 <button
                   onClick={onLogout}

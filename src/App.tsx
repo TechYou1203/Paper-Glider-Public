@@ -7,6 +7,7 @@ import { LeaderboardModal } from './components/LeaderboardModal';
 import { DailyChallengesModal } from './components/DailyChallengesModal';
 import { HangarModal } from './components/HangarModal';
 import { AuthModal } from './components/AuthModal';
+import { AccountModal } from './components/AccountModal';
 import {
   DailyChallenge,
   FlightInput,
@@ -45,6 +46,7 @@ import {
 } from './game/simulation';
 import {
   claimChallenge as apiClaimChallenge,
+  deleteServerAccount,
   equipSkin as apiEquipSkin,
   fetchDailyChallenges as apiFetchChallenges,
   fetchLeaderboard as apiFetchLeaderboard,
@@ -55,12 +57,14 @@ import {
   reconnectServerWithDetails,
   startFlight as apiStartFlight,
   submitFlight as apiSubmitFlight,
+  syncPilotAccount,
   unlockSkin as apiUnlockSkin,
   updateSettings as apiUpdateSettings,
 } from './api/client';
 import {
   getCurrentSession,
   logoutUser,
+  deletePilotAccount,
   syncCloudStats,
   loadCloudStats,
   checkAndCompleteEmailLinkSignIn,
@@ -104,6 +108,7 @@ export default function App() {
   const [showLeaderboard, setShowLeaderboard] = useState<boolean>(false);
   const [showChallenges, setShowChallenges] = useState<boolean>(false);
   const [showHangar, setShowHangar] = useState<boolean>(false);
+  const [showAccountModal, setShowAccountModal] = useState<boolean>(false);
 
   // Engine systems
   const particlePoolRef = useRef<ObjectPool<Particle>>(createParticlePool(100));
@@ -195,7 +200,11 @@ export default function App() {
     setChallenges(updatedChallenges);
 
     // Initialise Neon Backend Auth
-    initAuth(loaded.callsign).then(async (player) => {
+    const backendAuthPromise = session?.uid
+      ? syncPilotAccount(session.uid, loaded.callsign)
+      : initAuth(loaded.callsign);
+
+    backendAuthPromise.then(async (player) => {
       if (player) {
         setIsOnline(true);
         setUserStats((prev) => {
@@ -852,14 +861,32 @@ export default function App() {
       }
     } catch {}
 
-    // Synchronize pilot callsign with Neon database
-    initAuth(user.username)
-      .then((player) => {
-        if (player) {
-          setIsOnline(true);
-        }
-      })
-      .catch(() => {});
+    // Synchronize pilot callsign & firebase UID with Neon database
+    try {
+      const player = await syncPilotAccount(user.uid, user.username);
+      if (player) {
+        setIsOnline(true);
+        setUserStats((prev) => {
+          const next = {
+            ...prev,
+            callsign: player.callsign || prev.callsign,
+            paperclips: Math.max(prev.paperclips, player.paperclips || 0),
+            unlockedSkins: Array.from(new Set([...prev.unlockedSkins, ...(player.unlockedSkins || [])])),
+            selectedSkin: player.equippedSkin || prev.selectedSkin,
+          };
+          saveUserStats(next);
+          return next;
+        });
+      }
+    } catch {
+      initAuth(user.username)
+        .then((player) => {
+          if (player) {
+            setIsOnline(true);
+          }
+        })
+        .catch(() => {});
+    }
   };
 
   const handleContinueAsGuest = () => {
@@ -944,6 +971,41 @@ export default function App() {
     setFlightClips(0);
   };
 
+  const handleDeleteAccount = async (): Promise<{ success: boolean; error?: string }> => {
+    if (!currentUser) {
+      return { success: false, error: 'No active pilot session.' };
+    }
+
+    try {
+      // 1. Permanently delete from Neon PostgreSQL database (cascades flights, leaderboard, challenges)
+      await deleteServerAccount(currentUser.uid, currentUser.username);
+
+      // 2. Permanently delete from Firebase Authentication, Firestore, and local registry
+      const result = await deletePilotAccount(currentUser);
+
+      if (result.success) {
+        setCurrentUser(null);
+        setShowAccountModal(false);
+        if (typeof window !== 'undefined') {
+          localStorage.setItem('paper_glider_is_guest', 'true');
+          localStorage.removeItem('paper_glider_user_stats');
+          localStorage.removeItem('paper_glider_auth_token');
+        }
+        const fresh = getInitialUserStats();
+        setUserStats(fresh);
+        setHighScore(0);
+        setScore(0);
+        setFlightClips(0);
+        setLeaderboard([]);
+        return { success: true };
+      }
+
+      return { success: false, error: result.error };
+    } catch (err: any) {
+      return { success: false, error: err?.message || 'Failed to delete account.' };
+    }
+  };
+
   return (
     <div className="relative w-screen h-screen overflow-hidden bg-[#faf7ed] select-none touch-none">
       <canvas
@@ -962,6 +1024,7 @@ export default function App() {
           onToggleSound={handleToggleSound}
           onOpenAuth={() => setShowAuthModal(true)}
           onLogout={handleLogout}
+          onOpenAccount={() => setShowAccountModal(true)}
           onReconnect={handleReconnect}
           currentUser={currentUser}
           stats={userStats}
@@ -1057,6 +1120,17 @@ export default function App() {
           onClose={() => setShowAuthModal(false)}
           canClose={Boolean(currentUser || (typeof window !== 'undefined' && localStorage.getItem('paper_glider_is_guest') === 'true'))}
           initialMode={authModalMode}
+        />
+      )}
+
+      {showAccountModal && currentUser && (
+        <AccountModal
+          currentUser={currentUser}
+          stats={userStats}
+          isOnline={isOnline}
+          onClose={() => setShowAccountModal(false)}
+          onLogout={handleLogout}
+          onDeleteAccount={handleDeleteAccount}
         />
       )}
     </div>

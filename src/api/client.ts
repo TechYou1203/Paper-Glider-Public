@@ -281,6 +281,45 @@ export async function reconnectServer(callsign?: string): Promise<ServerPlayer |
   return initAuth(callsign);
 }
 
+/**
+ * Sync signed-in Firebase pilot with Neon DB.
+ */
+export async function syncPilotAccount(firebaseUid: string, callsign: string): Promise<ServerPlayer | null> {
+  const data = await apiFetch<{ token: string; player: ServerPlayer }>('/auth/sync-pilot', {
+    method: 'POST',
+    body: JSON.stringify({ firebaseUid, callsign }),
+  });
+  if (data?.token) {
+    setToken(data.token);
+    updateServerStatus(true);
+    return data.player;
+  }
+  return null;
+}
+
+/**
+ * Permanently delete pilot account and all associated records from Neon DB.
+ */
+export async function deleteServerAccount(firebaseUid?: string, callsign?: string): Promise<boolean> {
+  const token = getToken();
+  try {
+    const res = await fetch(`${API_BASE}/auth/account`, {
+      method: 'DELETE',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      },
+      body: JSON.stringify({ firebaseUid, callsign, token }),
+    });
+    clearToken();
+    return res.ok;
+  } catch (err) {
+    console.warn('Delete server account failed:', err);
+    clearToken();
+    return false;
+  }
+}
+
 // ─── Flights ────────────────────────────────────────────────
 
 export async function startFlight(): Promise<FlightStartResponse | null> {
