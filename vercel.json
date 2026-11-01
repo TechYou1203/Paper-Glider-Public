@@ -3,7 +3,23 @@
   "outputDirectory": "dist",
   "rewrites": [
     {
-      "source": "/api/(.*)",
+      "source": "/api/auth/(.*)",
+      "destination": "/api"
+    },
+    {
+      "source": "/api/leaderboard(.*)",
+      "destination": "/api"
+    },
+    {
+      "source": "/api/flights/(.*)",
+      "destination": "/api"
+    },
+    {
+      "source": "/api/challenges(.*)",
+      "destination": "/api"
+    },
+    {
+      "source": "/api/inventory/(.*)",
       "destination": "/api"
     }
   ]

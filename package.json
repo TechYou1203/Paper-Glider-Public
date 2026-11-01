@@ -7,7 +7,7 @@
     "dev": "vite --port=3000 --host=0.0.0.0",
     "server": "tsx watch server/index.ts",
     "build:client": "vite build",
-    "build:server": "esbuild server/api.ts --bundle --platform=node --format=esm --target=node20 --outfile=api/index.js && esbuild server/health.ts --bundle --platform=node --format=esm --target=node20 --outfile=api/health.js",
+    "build:server": "esbuild server/api.ts --bundle --platform=node --format=esm --target=node20 --banner:js=\"import { createRequire } from 'module'; const require = createRequire(import.meta.url);\" --outfile=api/index.js",
     "build": "npm run build:client && npm run build:server",
     "start": "tsx server/index.ts",
     "preview": "vite preview",
