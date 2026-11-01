@@ -56,3 +56,19 @@ CREATE INDEX IF NOT EXISTS idx_flights_player ON flights(player_id);
 CREATE INDEX IF NOT EXISTS idx_daily_player_date ON daily_challenge_progress(player_id, challenge_date);
 CREATE INDEX IF NOT EXISTS idx_players_token ON players(guest_token);
 CREATE INDEX IF NOT EXISTS idx_players_firebase_uid ON players(firebase_uid);
+
+CREATE TABLE IF NOT EXISTS verification_codes (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  email VARCHAR(255) NOT NULL,
+  username VARCHAR(64) NOT NULL,
+  code VARCHAR(16) NOT NULL,
+  type VARCHAR(32) NOT NULL DEFAULT 'signup',
+  password_hash VARCHAR(255),
+  expires_at TIMESTAMPTZ NOT NULL,
+  verified BOOLEAN DEFAULT false,
+  attempts INTEGER DEFAULT 0,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_verification_email_code ON verification_codes(email, code);
+CREATE INDEX IF NOT EXISTS idx_verification_expires ON verification_codes(expires_at);

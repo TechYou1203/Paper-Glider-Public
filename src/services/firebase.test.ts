@@ -13,6 +13,7 @@ import {
   runWithTimeout,
   deletePilotAccount,
   getCurrentSession,
+  completeVerifiedEmailAuth,
 } from './firebase';
 
 test('auth: username normalization lowercases and trims', () => {
@@ -146,4 +147,19 @@ test('auth: deletePilotAccount permanently removes pilot user and frees up calls
   // Callsign is now available again for registration
   const availableAfter = await checkUsernameAvailable(username);
   assert.equal(availableAfter, true);
+});
+
+test('auth: completeVerifiedEmailAuth activates session with verified callsign and email', async () => {
+  const verifiedUsername = 'Verified_' + Math.random().toString(36).substring(2, 8);
+  const testEmail = `${verifiedUsername.toLowerCase()}@gmail.com`;
+
+  const authRes = await completeVerifiedEmailAuth(verifiedUsername, testEmail);
+  assert.equal(authRes.success, true);
+  assert.equal(authRes.user?.username, verifiedUsername);
+  assert.equal(authRes.user?.email, testEmail);
+
+  // Active session exists
+  const session = getCurrentSession();
+  assert.equal(session?.username, verifiedUsername);
+  assert.equal(session?.email, testEmail);
 });

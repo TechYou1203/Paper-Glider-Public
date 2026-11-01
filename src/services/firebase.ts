@@ -275,6 +275,105 @@ export async function checkUsernameAvailable(
 }
 
 /**
+ * Complete authentication after 6-digit email OTP verification.
+ */
+export async function completeVerifiedEmailAuth(
+  username: string,
+  email: string,
+  password?: string
+): Promise<AuthResult> {
+  const trimmedUser = username.trim();
+  const trimmedEmail = email.trim().toLowerCase();
+  const norm = normalizeUsername(trimmedUser);
+  const pass = password || `pilot_${norm}_pg2026!`;
+
+  if (auth && isFirebaseConfigured) {
+    try {
+      let user: User | null = null;
+      try {
+        const cred = await createUserWithEmailAndPassword(auth, trimmedEmail, pass);
+        user = cred.user;
+      } catch (err: any) {
+        if (err.code === 'auth/email-already-in-use') {
+          try {
+            const loginCred = await signInWithEmailAndPassword(auth, trimmedEmail, pass);
+            user = loginCred.user;
+          } catch {
+            // Email verified through backend OTP
+          }
+        }
+      }
+
+      if (user) {
+        try {
+          await updateProfile(user, { displayName: trimmedUser });
+        } catch {}
+
+        if (db) {
+          await runWithTimeout(
+            async () => {
+              await setDoc(doc(db, 'usernames', norm), {
+                username: trimmedUser,
+                uid: user!.uid,
+                email: trimmedEmail,
+                hasRealEmail: true,
+                createdAt: serverTimestamp(),
+              });
+              await setDoc(
+                doc(db, 'users', user!.uid),
+                {
+                  uid: user!.uid,
+                  username: trimmedUser,
+                  email: trimmedEmail,
+                  updatedAt: serverTimestamp(),
+                },
+                { merge: true }
+              );
+            },
+            4000,
+            null
+          );
+        }
+
+        const pilotUser: PilotUser = {
+          uid: user.uid,
+          username: trimmedUser,
+          email: trimmedEmail,
+        };
+        saveCurrentSession(pilotUser);
+        return { success: true, user: pilotUser };
+      }
+    } catch (err: any) {
+      console.warn('Firebase verified auth notice:', err);
+    }
+  }
+
+  // Local fallback registration
+  const localUsers = getLocalUsers();
+  const uid = localUsers[norm]?.uid || `local-${Date.now()}`;
+  localUsers[norm] = {
+    uid,
+    username: trimmedUser,
+    email: trimmedEmail,
+    passwordHash: pass,
+    paperclips: localUsers[norm]?.paperclips || 0,
+    highScore: localUsers[norm]?.highScore || 0,
+    equippedSkin: localUsers[norm]?.equippedSkin || 'classic',
+    unlockedSkins: localUsers[norm]?.unlockedSkins || ['classic'],
+    createdAt: new Date().toISOString(),
+  };
+  saveLocalUsers(localUsers);
+
+  const pilotUser: PilotUser = {
+    uid,
+    username: trimmedUser,
+    email: trimmedEmail,
+  };
+  saveCurrentSession(pilotUser);
+  return { success: true, user: pilotUser };
+}
+
+/**
  * Register a new user with Username, Password, and optional Recovery Email.
  */
 export async function registerWithUsername(

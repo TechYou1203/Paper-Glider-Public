@@ -320,6 +320,83 @@ export async function deleteServerAccount(firebaseUid?: string, callsign?: strin
   }
 }
 
+/**
+ * Send 6-digit email verification code with username validation.
+ */
+export async function sendVerificationCode(
+  email: string,
+  username: string,
+  type: 'signup' | 'login' = 'signup'
+): Promise<{
+  success: boolean;
+  message?: string;
+  error?: string;
+  email?: string;
+  username?: string;
+  simulated?: boolean;
+  devCode?: string;
+}> {
+  try {
+    const res = await fetch(`${API_BASE}/auth/send-verification-code`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email, username, type }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      return { success: false, error: data?.error || 'Failed to send verification code.' };
+    }
+    return {
+      success: true,
+      message: data.message,
+      email: data.email,
+      username: data.username,
+      simulated: data.simulated,
+      devCode: data.devCode,
+    };
+  } catch (err: any) {
+    return { success: false, error: err?.message || 'Network error sending verification code.' };
+  }
+}
+
+/**
+ * Verify 6-digit code sent to pilot's email address.
+ */
+export async function verifyAuthCode(
+  email: string,
+  code: string,
+  username?: string,
+  type: 'signup' | 'login' = 'signup'
+): Promise<{
+  success: boolean;
+  token?: string;
+  player?: ServerPlayer;
+  error?: string;
+}> {
+  try {
+    const res = await fetch(`${API_BASE}/auth/verify-code`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email, code, username, type }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      return { success: false, error: data?.error || 'Invalid verification code.' };
+    }
+    if (data.token) {
+      setToken(data.token);
+      updateServerStatus(true);
+    }
+    return {
+      success: true,
+      token: data.token,
+      player: data.player,
+    };
+  } catch (err: any) {
+    return { success: false, error: err?.message || 'Network error verifying code.' };
+  }
+}
+
 // ─── Flights ────────────────────────────────────────────────
 
 export async function startFlight(): Promise<FlightStartResponse | null> {

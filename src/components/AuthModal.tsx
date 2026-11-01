@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import {
   X,
   User,
@@ -10,6 +10,9 @@ import {
   Sparkles,
   KeyRound,
   Send,
+  ShieldCheck,
+  RefreshCw,
+  Info,
 } from 'lucide-react';
 import {
   loginWithUsername,
@@ -20,7 +23,10 @@ import {
   recoverUsernameByEmail,
   sendPasswordlessLoginLink,
   checkAndCompleteEmailLinkSignIn,
+  checkUsernameAvailable,
+  completeVerifiedEmailAuth,
 } from '../services/firebase';
+import { sendVerificationCode, verifyAuthCode, syncPilotAccount } from '../api/client';
 import type { PilotUser } from '../game/types';
 
 interface AuthModalProps {
@@ -31,7 +37,7 @@ interface AuthModalProps {
   canClose?: boolean;
 }
 
-type ModalTab = 'login' | 'register' | 'forgot' | 'google-username' | 'email-confirm';
+type ModalTab = 'login' | 'register' | 'verify-code' | 'forgot' | 'google-username' | 'email-confirm';
 
 export const AuthModal: React.FC<AuthModalProps> = ({
   onSuccess,
@@ -41,25 +47,37 @@ export const AuthModal: React.FC<AuthModalProps> = ({
   canClose = true,
 }) => {
   const [tab, setTab] = useState<ModalTab>(initialMode);
-  const [loginMethod, setLoginMethod] = useState<'password' | 'magic-link'>('password');
+  const [loginMethod, setLoginMethod] = useState<'code' | 'password'>('code');
   const [forgotSubTab, setForgotSubTab] = useState<'password' | 'username'>('password');
+  const [verificationType, setVerificationType] = useState<'signup' | 'login'>('signup');
 
   // Form Fields
   const [username, setUsername] = useState('');
-  const [password, setPassword] = useState('');
   const [email, setEmail] = useState('');
-  const [magicLinkEmail, setMagicLinkEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [verificationCode, setVerificationCode] = useState('');
   const [forgotInput, setForgotInput] = useState('');
   const [confirmEmail, setConfirmEmail] = useState('');
+  const [devCodeHint, setDevCodeHint] = useState<string | null>(null);
 
   // States
   const [loading, setLoading] = useState(false);
   const [googleLoading, setGoogleLoading] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
+  const [resendCooldown, setResendCooldown] = useState<number>(0);
+
+  // Pending Google Sign-In state
   const [pendingGoogleUid, setPendingGoogleUid] = useState<string | null>(null);
   const [pendingGoogleEmail, setPendingGoogleEmail] = useState<string | undefined>(undefined);
   const [pendingGooglePhoto, setPendingGooglePhoto] = useState<string | undefined>(undefined);
+
+  // Resend cooldown timer
+  useEffect(() => {
+    if (resendCooldown <= 0) return;
+    const timer = setTimeout(() => setResendCooldown((prev) => prev - 1), 1000);
+    return () => clearTimeout(timer);
+  }, [resendCooldown]);
 
   // Clear messages when switching tabs
   const switchTab = (newTab: ModalTab) => {
@@ -68,15 +86,29 @@ export const AuthModal: React.FC<AuthModalProps> = ({
     setSuccessMessage(null);
   };
 
-  // ─── 1. Register with Username, Email & Password ──────────────────────────
-  const handleRegister = async (e: React.FormEvent) => {
+  // ─── 1. Initiate Sign-Up with Email & Callsign Validation ────────────────
+  const handleInitiateSignup = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!username.trim()) {
-      setErrorMessage('Please enter a pilot username.');
+    const cleanEmail = email.trim().toLowerCase();
+    const cleanUsername = username.trim();
+
+    if (!cleanEmail || !cleanEmail.includes('@') || !cleanEmail.includes('.')) {
+      setErrorMessage('Please enter a valid email address.');
       return;
     }
-    if (!password) {
-      setErrorMessage('Please enter a password.');
+
+    if (!cleanUsername || cleanUsername.length < 3) {
+      setErrorMessage('Pilot username must be at least 3 characters long.');
+      return;
+    }
+
+    if (!/^[a-zA-Z0-9_-]+$/.test(cleanUsername)) {
+      setErrorMessage('Username can only contain letters, numbers, underscores, and dashes.');
+      return;
+    }
+
+    if (password && password.length < 6) {
+      setErrorMessage('Password must be at least 6 characters long.');
       return;
     }
 
@@ -85,26 +117,149 @@ export const AuthModal: React.FC<AuthModalProps> = ({
     setSuccessMessage(null);
 
     try {
-      const res = await registerWithUsername(
-        username.trim(),
-        password,
-        email.trim() || undefined
-      );
+      // 1. Validate username is not taken in Firebase
+      const available = await checkUsernameAvailable(cleanUsername);
+      if (!available) {
+        setErrorMessage('This username is taken, try a different one.');
+        setLoading(false);
+        return;
+      }
+
+      // 2. Request backend 6-digit verification code
+      const res = await sendVerificationCode(cleanEmail, cleanUsername, 'signup');
 
       if (!res.success) {
-        setErrorMessage(res.error || 'Registration failed.');
-      } else if (res.user) {
-        onSuccess(res.user);
+        setErrorMessage(res.error || 'Failed to send verification code. Please try again.');
+      } else {
+        setVerificationType('signup');
+        setVerificationCode('');
+        setDevCodeHint(res.devCode || null);
+        setResendCooldown(45);
+        setSuccessMessage('Verification code sent to your email! Please check your inbox or spam folder.');
+        setTab('verify-code');
       }
     } catch (err: any) {
-      setErrorMessage(err.message || 'Registration failed.');
+      setErrorMessage(err.message || 'Verification request failed. Please check network.');
     } finally {
       setLoading(false);
     }
   };
 
-  // ─── 2. Login with Username or Email & Password ───────────────────────────
-  const handleLogin = async (e: React.FormEvent) => {
+  // ─── 2. Initiate Email Code Login ─────────────────────────────────────────
+  const handleInitiateCodeLogin = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const cleanEmail = email.trim().toLowerCase();
+    const cleanUsername = username.trim() || cleanEmail.split('@')[0];
+
+    if (!cleanEmail || !cleanEmail.includes('@')) {
+      setErrorMessage('Please enter your registered email address.');
+      return;
+    }
+
+    setLoading(true);
+    setErrorMessage(null);
+    setSuccessMessage(null);
+
+    try {
+      const res = await sendVerificationCode(cleanEmail, cleanUsername, 'login');
+
+      if (!res.success) {
+        setErrorMessage(res.error || 'Failed to send verification code.');
+      } else {
+        setVerificationType('login');
+        setVerificationCode('');
+        setDevCodeHint(res.devCode || null);
+        setResendCooldown(45);
+        setSuccessMessage('Login verification code sent! Check your inbox or spam folder.');
+        setTab('verify-code');
+      }
+    } catch (err: any) {
+      setErrorMessage(err.message || 'Login request failed.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // ─── 3. Verify 6-Digit Code & Launch Flight ───────────────────────────────
+  const handleVerifyCodeSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const cleanCode = verificationCode.trim();
+
+    if (!cleanCode || cleanCode.length < 6) {
+      setErrorMessage('Please enter the complete 6-digit verification code.');
+      return;
+    }
+
+    setLoading(true);
+    setErrorMessage(null);
+    setSuccessMessage(null);
+
+    try {
+      // 1. Verify code on server
+      const res = await verifyAuthCode(
+        email.trim().toLowerCase(),
+        cleanCode,
+        username.trim(),
+        verificationType
+      );
+
+      if (!res.success) {
+        setErrorMessage(
+          res.error || 'Invalid or expired verification code. Please check your Gmail (including Spam folder) and try again.'
+        );
+        setLoading(false);
+        return;
+      }
+
+      // 2. Complete verified authentication across Firebase and local profile
+      const authRes = await completeVerifiedEmailAuth(
+        username.trim(),
+        email.trim().toLowerCase(),
+        password || undefined
+      );
+
+      if (authRes.success && authRes.user) {
+        // 3. Link pilot with Neon DB
+        await syncPilotAccount(authRes.user.uid, authRes.user.username).catch(() => {});
+        onSuccess(authRes.user);
+      } else {
+        setErrorMessage(authRes.error || 'Failed to finalize pilot profile.');
+      }
+    } catch (err: any) {
+      setErrorMessage(err.message || 'Verification failed. Please try again.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // ─── 4. Resend Verification Code ──────────────────────────────────────────
+  const handleResendCode = async () => {
+    if (resendCooldown > 0) return;
+    setLoading(true);
+    setErrorMessage(null);
+
+    try {
+      const res = await sendVerificationCode(
+        email.trim().toLowerCase(),
+        username.trim(),
+        verificationType
+      );
+      if (res.success) {
+        setResendCooldown(45);
+        setDevCodeHint(res.devCode || null);
+        setSuccessMessage('A fresh verification code has been dispatched to your email!');
+      } else {
+        setErrorMessage(res.error || 'Failed to resend code.');
+      }
+    } catch (err: any) {
+      setErrorMessage(err.message || 'Resend failed.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // ─── 5. Password Login Fallback ───────────────────────────────────────────
+  const handlePasswordLogin = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!username.trim()) {
       setErrorMessage('Please enter your username or email.');
@@ -138,67 +293,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
     }
   };
 
-  // ─── 3. Passwordless Magic Link Sign-In ──────────────────────────────────
-  const handleSendMagicLink = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!magicLinkEmail.trim()) {
-      setErrorMessage('Please enter your email address.');
-      return;
-    }
-
-    setLoading(true);
-    setErrorMessage(null);
-    setSuccessMessage(null);
-
-    try {
-      const res = await sendPasswordlessLoginLink(magicLinkEmail.trim());
-
-      if (!res.success) {
-        setErrorMessage(res.error || 'Failed to send magic login link.');
-      } else {
-        setSuccessMessage(res.message || 'Magic login link sent to your email! Check your inbox.');
-      }
-    } catch (err: any) {
-      setErrorMessage(err.message || 'Failed to send magic login link.');
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  // ─── 4. Confirm Email for Magic Link opened on different browser ──────────
-  const handleConfirmMagicLinkEmail = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!confirmEmail.trim()) {
-      setErrorMessage('Please enter your email address.');
-      return;
-    }
-
-    setLoading(true);
-    setErrorMessage(null);
-
-    try {
-      const { isEmailLink, result } = await checkAndCompleteEmailLinkSignIn(
-        window.location.href,
-        confirmEmail.trim()
-      );
-
-      if (!isEmailLink || !result?.success) {
-        setErrorMessage(result?.error || 'Invalid or expired email sign-in link.');
-      } else if (result.needsUsername && result.user) {
-        setPendingGoogleUid(result.user.uid);
-        setPendingGoogleEmail(result.user.email);
-        setTab('google-username');
-      } else if (result.user) {
-        onSuccess(result.user);
-      }
-    } catch (err: any) {
-      setErrorMessage(err.message || 'Failed to complete sign-in.');
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  // ─── 5. Google Sign-In ───────────────────────────────────────────────────
+  // ─── 6. Google Sign-In ───────────────────────────────────────────────────
   const handleGoogleLogin = async () => {
     setGoogleLoading(true);
     setErrorMessage(null);
@@ -225,7 +320,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
     }
   };
 
-  // ─── 6. Complete Google / Passwordless Username Selection ─────────────────
+  // ─── 7. Complete Google Username Selection ────────────────────────────────
   const handleCompleteUsername = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!pendingGoogleUid || !username.trim()) {
@@ -249,13 +344,13 @@ export const AuthModal: React.FC<AuthModalProps> = ({
         onSuccess(res.user);
       }
     } catch (err: any) {
-      setErrorMessage(err.message || 'Failed to register username.');
+      setErrorMessage(err.message || 'Failed to complete registration.');
     } finally {
       setLoading(false);
     }
   };
 
-  // ─── 7. Forgot Password / Username ───────────────────────────────────────
+  // ─── 8. Account Recovery ──────────────────────────────────────────────────
   const handleForgotSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!forgotInput.trim()) {
@@ -293,7 +388,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4 bg-[#262421]/60 backdrop-blur-xs select-none overflow-y-auto animate-fade-in">
       <div className="relative w-full max-w-md bg-[#fffef9] border-3 border-[#2d2a26] rounded-2xl shadow-[6px_6px_0px_#2d2a26] p-5 sm:p-6 text-center my-auto">
-        {/* Close Button (if applicable) */}
+        {/* Close Button */}
         {canClose && onClose && (
           <button
             onClick={onClose}
@@ -304,38 +399,31 @@ export const AuthModal: React.FC<AuthModalProps> = ({
           </button>
         )}
 
-        {/* Project Logo Emblem */}
+        {/* Project Logo */}
         <div className="flex justify-center mb-3">
           <div className="w-16 h-16 sm:w-20 sm:h-20 rounded-2xl bg-[#fffef9] border-2 border-[#2d2a26] shadow-[3px_3px_0px_#2d2a26] flex items-center justify-center p-1.5 overflow-hidden">
-            <img
-              src="/logo.svg"
-              alt="Paper Glider Logo"
-              className="w-full h-full object-contain"
-            />
+            <img src="/logo.svg" alt="Paper Glider Logo" className="w-full h-full object-contain" />
           </div>
         </div>
 
         {/* Header Title */}
         <h2 className="font-title text-3xl sm:text-4xl font-extrabold text-[#1e293b] leading-tight">
-          {tab === 'register' && 'Enter Pilot Username'}
-          {tab === 'login' && (loginMethod === 'magic-link' ? 'Magic Link Login' : 'Pilot Sign In')}
+          {tab === 'register' && 'Pilot Registration'}
+          {tab === 'verify-code' && 'Enter Verification Code'}
+          {tab === 'login' && 'Pilot Sign In'}
           {tab === 'forgot' && 'Account Recovery'}
           {tab === 'google-username' && 'Choose Your Callsign'}
-          {tab === 'email-confirm' && 'Confirm Email Sign-In'}
         </h2>
         <p className="font-sketch text-xs sm:text-sm font-bold text-[#64748b] mt-0.5 mb-4">
-          {tab === 'register' && 'Create your pilot callsign to save high scores & sync across devices.'}
-          {tab === 'login' &&
-            (loginMethod === 'magic-link'
-              ? 'Receive an instant login link to sign in without typing a password.'
-              : 'Sign in with your Username or Email to access your saved records.')}
+          {tab === 'register' && 'Enter your email & unique pilot callsign to receive your verification code.'}
+          {tab === 'verify-code' && 'Enter the 6-digit code sent to your email to verify your flight authorization.'}
+          {tab === 'login' && 'Sign in to access your saved high scores and global ranks.'}
           {tab === 'forgot' && 'Recover your forgotten username or reset your account password.'}
           {tab === 'google-username' && 'Choose a unique pilot callsign for the leaderboard.'}
-          {tab === 'email-confirm' && 'Confirm your email to complete passwordless sign-in.'}
         </p>
 
         {/* Primary Tabs (Register vs Login) */}
-        {tab !== 'google-username' && tab !== 'forgot' && tab !== 'email-confirm' && (
+        {tab !== 'verify-code' && tab !== 'google-username' && tab !== 'forgot' && tab !== 'email-confirm' && (
           <div className="grid grid-cols-2 gap-2 p-1 bg-[#f1f5f9] border-2 border-[#2d2a26] rounded-xl mb-4">
             <button
               type="button"
@@ -382,12 +470,31 @@ export const AuthModal: React.FC<AuthModalProps> = ({
           </div>
         )}
 
-        {/* ─── TAB 1: REGISTER WITH USERNAME, EMAIL & PASSWORD ───────────── */}
+        {/* ─── TAB 1: SIGN UP WITH EMAIL, USERNAME & VERIFICATION CODE ─────── */}
         {tab === 'register' && (
-          <form onSubmit={handleRegister} className="space-y-3 text-left">
+          <form onSubmit={handleInitiateSignup} className="space-y-3 text-left">
             <div>
               <label className="block font-sketch text-xs font-bold text-[#475569] uppercase tracking-wider mb-1">
-                Pilot Username / Callsign <span className="text-[#dc2626]">*</span>
+                Email Address <span className="text-[#dc2626]">*</span>
+              </label>
+              <div className="relative">
+                <span className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none text-[#64748b]">
+                  <Mail size={16} />
+                </span>
+                <input
+                  type="email"
+                  required
+                  value={email}
+                  onChange={(e) => setEmail(e.target.value)}
+                  placeholder="your.email@gmail.com"
+                  className="w-full pl-9 pr-3 py-2 bg-[#ffffff] border-2 border-[#2d2a26] rounded-xl font-sketch text-base font-bold text-[#1e293b] focus:outline-none focus:ring-2 focus:ring-[#facc15] shadow-[2px_2px_0px_#2d2a26]"
+                />
+              </div>
+            </div>
+
+            <div>
+              <label className="block font-sketch text-xs font-bold text-[#475569] uppercase tracking-wider mb-1">
+                Pilot Callsign / Username <span className="text-[#dc2626]">*</span>
               </label>
               <div className="relative">
                 <span className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none text-[#64748b]">
@@ -396,36 +503,22 @@ export const AuthModal: React.FC<AuthModalProps> = ({
                 <input
                   type="text"
                   required
+                  minLength={3}
                   maxLength={24}
                   value={username}
                   onChange={(e) => setUsername(e.target.value)}
-                  placeholder="e.g. MaverickPilot"
+                  placeholder="e.g. AcePilot99"
                   className="w-full pl-9 pr-3 py-2 bg-[#ffffff] border-2 border-[#2d2a26] rounded-xl font-sketch text-base font-bold text-[#1e293b] focus:outline-none focus:ring-2 focus:ring-[#facc15] shadow-[2px_2px_0px_#2d2a26]"
                 />
               </div>
+              <p className="font-sketch text-[11px] text-[#64748b] mt-0.5">
+                We'll validate that this callsign is unique before dispatching your flight code.
+              </p>
             </div>
 
             <div>
               <label className="block font-sketch text-xs font-bold text-[#475569] uppercase tracking-wider mb-1">
-                Email Address <span className="text-[#94a3b8] font-normal">(For passwordless & recovery)</span>
-              </label>
-              <div className="relative">
-                <span className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none text-[#64748b]">
-                  <Mail size={16} />
-                </span>
-                <input
-                  type="email"
-                  value={email}
-                  onChange={(e) => setEmail(e.target.value)}
-                  placeholder="pilot@example.com"
-                  className="w-full pl-9 pr-3 py-2 bg-[#ffffff] border-2 border-[#2d2a26] rounded-xl font-sketch text-base font-bold text-[#1e293b] focus:outline-none focus:ring-2 focus:ring-[#facc15] shadow-[2px_2px_0px_#2d2a26]"
-                />
-              </div>
-            </div>
-
-            <div>
-              <label className="block font-sketch text-xs font-bold text-[#475569] uppercase tracking-wider mb-1">
-                Password <span className="text-[#dc2626]">*</span>
+                Password <span className="text-[#94a3b8] font-normal">(Optional backup)</span>
               </label>
               <div className="relative">
                 <span className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none text-[#64748b]">
@@ -433,11 +526,10 @@ export const AuthModal: React.FC<AuthModalProps> = ({
                 </span>
                 <input
                   type="password"
-                  required
                   minLength={6}
                   value={password}
                   onChange={(e) => setPassword(e.target.value)}
-                  placeholder="At least 6 characters"
+                  placeholder="Leave blank for code-only login"
                   className="w-full pl-9 pr-3 py-2 bg-[#ffffff] border-2 border-[#2d2a26] rounded-xl font-sketch text-base font-bold text-[#1e293b] focus:outline-none focus:ring-2 focus:ring-[#facc15] shadow-[2px_2px_0px_#2d2a26]"
                 />
               </div>
@@ -448,17 +540,146 @@ export const AuthModal: React.FC<AuthModalProps> = ({
               disabled={loading}
               className="w-full mt-2 py-3 bg-[#fde047] hover:bg-[#facc15] active:translate-x-0.5 active:translate-y-0.5 text-[#1e293b] font-sketch text-lg font-black border-2 border-[#2d2a26] rounded-xl shadow-[3px_3px_0px_#2d2a26] transition-all cursor-pointer flex items-center justify-center gap-2 disabled:opacity-50"
             >
-              {loading ? 'Validating Username...' : 'Save Username & Start Flying'}
-              <ArrowRight size={18} />
+              {loading ? (
+                <>
+                  <RefreshCw size={18} className="animate-spin" />
+                  <span>Validating & Dispatching Code...</span>
+                </>
+              ) : (
+                <>
+                  <span>Send Verification Code</span>
+                  <ArrowRight size={18} />
+                </>
+              )}
             </button>
           </form>
         )}
 
-        {/* ─── TAB 2: SIGN IN (PASSWORD OR PASSWORDLESS MAGIC LINK) ───────── */}
+        {/* ─── TAB 2: VERIFICATION CODE ENTRY SCREEN ──────────────────────── */}
+        {tab === 'verify-code' && (
+          <form onSubmit={handleVerifyCodeSubmit} className="space-y-3.5 text-left animate-in fade-in">
+            {/* Pilot Identity Capsule */}
+            <div className="p-3 bg-[#f8fafc] border-2 border-[#2d2a26] rounded-xl shadow-[2px_2px_0px_#2d2a26] flex items-center justify-between">
+              <div>
+                <span className="font-sketch text-[11px] font-bold uppercase text-[#64748b] block">
+                  Authorizing Pilot
+                </span>
+                <span className="font-title text-base font-black text-[#0284c7]">
+                  {username || 'Aviator'}
+                </span>
+              </div>
+              <div className="text-right">
+                <span className="font-sketch text-[11px] font-bold uppercase text-[#64748b] block">
+                  Sent To Email
+                </span>
+                <span className="font-sketch text-xs font-bold text-[#1e293b] truncate max-w-[180px] block">
+                  {email}
+                </span>
+              </div>
+            </div>
+
+            {/* Spam Section Callout (As specifically requested by user) */}
+            <div className="p-3 bg-[#fef3c7] border-2 border-[#d97706] rounded-xl text-left flex items-start gap-2.5 shadow-[2px_2px_0px_#d97706]">
+              <AlertTriangle className="text-[#d97706] shrink-0 mt-0.5" size={18} />
+              <div className="font-sketch text-xs sm:text-sm font-bold text-[#92400e] leading-snug">
+                <p className="font-black mb-0.5">Cannot find the code in your Gmail inbox?</p>
+                <p>
+                  Please check your <u>Spam or Junk folder</u>! Automated verification emails may occasionally land there if not marked as safe.
+                </p>
+              </div>
+            </div>
+
+            {/* Development Simulation Hint (When SMTP credentials are not yet configured) */}
+            {devCodeHint && (
+              <div className="p-2.5 bg-[#e0f2fe] border-2 border-[#0284c7] rounded-xl text-center shadow-[2px_2px_0px_#0284c7]">
+                <p className="font-sketch text-xs font-bold text-[#0369a1]">
+                  🔧 Simulation Mode (No SMTP key): Code is{' '}
+                  <span className="font-mono text-base font-black text-[#0c4a6e] bg-[#bae6fd] px-2 py-0.5 rounded">
+                    {devCodeHint}
+                  </span>
+                </p>
+              </div>
+            )}
+
+            {/* 6-Digit Code Input Box */}
+            <div>
+              <label className="block font-sketch text-xs font-bold text-[#475569] uppercase tracking-wider mb-1.5 text-center">
+                Enter 6-Digit Verification Code
+              </label>
+              <input
+                type="text"
+                required
+                autoFocus
+                maxLength={6}
+                value={verificationCode}
+                onChange={(e) => setVerificationCode(e.target.value.replace(/[^0-9]/g, ''))}
+                placeholder="123456"
+                className="w-full text-center py-3 bg-[#ffffff] border-3 border-[#2d2a26] rounded-xl font-mono text-3xl font-black text-[#1e293b] tracking-[8px] focus:outline-none focus:ring-3 focus:ring-[#facc15] shadow-[3px_3px_0px_#2d2a26]"
+              />
+            </div>
+
+            {/* Verify & Launch Button */}
+            <button
+              type="submit"
+              disabled={loading || verificationCode.length < 6}
+              className="w-full py-3 bg-[#fde047] hover:bg-[#facc15] active:translate-x-0.5 active:translate-y-0.5 text-[#1e293b] font-sketch text-lg font-black border-2 border-[#2d2a26] rounded-xl shadow-[3px_3px_0px_#2d2a26] transition-all cursor-pointer flex items-center justify-center gap-2 disabled:opacity-50"
+            >
+              {loading ? (
+                <>
+                  <RefreshCw size={18} className="animate-spin" />
+                  <span>Verifying Code...</span>
+                </>
+              ) : (
+                <>
+                  <ShieldCheck size={20} />
+                  <span>Verify Code & Start Flight</span>
+                </>
+              )}
+            </button>
+
+            {/* Secondary Actions: Resend & Edit Email */}
+            <div className="flex items-center justify-between pt-1 font-sketch text-xs font-bold">
+              <button
+                type="button"
+                onClick={handleResendCode}
+                disabled={resendCooldown > 0 || loading}
+                className="text-[#0284c7] hover:underline disabled:text-[#94a3b8] cursor-pointer"
+              >
+                {resendCooldown > 0 ? `Resend Code in ${resendCooldown}s` : 'Resend Code'}
+              </button>
+
+              <button
+                type="button"
+                onClick={() => switchTab(verificationType === 'signup' ? 'register' : 'login')}
+                className="text-[#64748b] hover:text-[#1e293b] hover:underline cursor-pointer"
+              >
+                ← Edit Email / Callsign
+              </button>
+            </div>
+          </form>
+        )}
+
+        {/* ─── TAB 3: SIGN IN ────────────────────────────────────────────── */}
         {tab === 'login' && (
           <div className="space-y-3">
             {/* Login Method Sub-Toggle */}
             <div className="flex gap-2 p-1 bg-[#f8fafc] border border-[#cbd5e1] rounded-xl mb-2">
+              <button
+                type="button"
+                onClick={() => {
+                  setLoginMethod('code');
+                  setErrorMessage(null);
+                  setSuccessMessage(null);
+                }}
+                className={`flex-1 py-1.5 text-xs font-sketch font-bold rounded-lg cursor-pointer flex items-center justify-center gap-1.5 ${
+                  loginMethod === 'code'
+                    ? 'bg-[#ffffff] text-[#1e293b] shadow-[1px_1px_0px_#2d2a26] border border-[#2d2a26]'
+                    : 'text-[#64748b]'
+                }`}
+              >
+                <Sparkles size={13} className="text-[#eab308]" />
+                <span>Email Verification Code</span>
+              </button>
               <button
                 type="button"
                 onClick={() => {
@@ -475,27 +696,69 @@ export const AuthModal: React.FC<AuthModalProps> = ({
                 <KeyRound size={13} />
                 <span>Password</span>
               </button>
-              <button
-                type="button"
-                onClick={() => {
-                  setLoginMethod('magic-link');
-                  setErrorMessage(null);
-                  setSuccessMessage(null);
-                }}
-                className={`flex-1 py-1.5 text-xs font-sketch font-bold rounded-lg cursor-pointer flex items-center justify-center gap-1.5 ${
-                  loginMethod === 'magic-link'
-                    ? 'bg-[#ffffff] text-[#1e293b] shadow-[1px_1px_0px_#2d2a26] border border-[#2d2a26]'
-                    : 'text-[#64748b]'
-                }`}
-              >
-                <Sparkles size={13} className="text-[#eab308]" />
-                <span>Passwordless (Magic Link)</span>
-              </button>
             </div>
 
-            {/* Sub-form A: Username / Email & Password */}
-            {loginMethod === 'password' ? (
-              <form onSubmit={handleLogin} className="space-y-3 text-left">
+            {/* Sub-form A: Email Verification Code Login */}
+            {loginMethod === 'code' ? (
+              <form onSubmit={handleInitiateCodeLogin} className="space-y-3 text-left">
+                <div>
+                  <label className="block font-sketch text-xs font-bold text-[#475569] uppercase tracking-wider mb-1">
+                    Registered Email Address <span className="text-[#dc2626]">*</span>
+                  </label>
+                  <div className="relative">
+                    <span className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none text-[#64748b]">
+                      <Mail size={16} />
+                    </span>
+                    <input
+                      type="email"
+                      required
+                      value={email}
+                      onChange={(e) => setEmail(e.target.value)}
+                      placeholder="your.email@gmail.com"
+                      className="w-full pl-9 pr-3 py-2 bg-[#ffffff] border-2 border-[#2d2a26] rounded-xl font-sketch text-base font-bold text-[#1e293b] focus:outline-none focus:ring-2 focus:ring-[#facc15] shadow-[2px_2px_0px_#2d2a26]"
+                    />
+                  </div>
+                </div>
+
+                <div>
+                  <label className="block font-sketch text-xs font-bold text-[#475569] uppercase tracking-wider mb-1">
+                    Pilot Username / Callsign <span className="text-[#94a3b8] font-normal">(Optional)</span>
+                  </label>
+                  <div className="relative">
+                    <span className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none text-[#64748b]">
+                      <User size={16} />
+                    </span>
+                    <input
+                      type="text"
+                      value={username}
+                      onChange={(e) => setUsername(e.target.value)}
+                      placeholder="Your pilot callsign"
+                      className="w-full pl-9 pr-3 py-2 bg-[#ffffff] border-2 border-[#2d2a26] rounded-xl font-sketch text-base font-bold text-[#1e293b] focus:outline-none focus:ring-2 focus:ring-[#facc15] shadow-[2px_2px_0px_#2d2a26]"
+                    />
+                  </div>
+                </div>
+
+                <button
+                  type="submit"
+                  disabled={loading}
+                  className="w-full mt-2 py-3 bg-[#fde047] hover:bg-[#facc15] active:translate-x-0.5 active:translate-y-0.5 text-[#1e293b] font-sketch text-lg font-black border-2 border-[#2d2a26] rounded-xl shadow-[3px_3px_0px_#2d2a26] transition-all cursor-pointer flex items-center justify-center gap-2 disabled:opacity-50"
+                >
+                  {loading ? (
+                    <>
+                      <RefreshCw size={18} className="animate-spin" />
+                      <span>Sending Code...</span>
+                    </>
+                  ) : (
+                    <>
+                      <span>Send 6-Digit Login Code</span>
+                      <ArrowRight size={18} />
+                    </>
+                  )}
+                </button>
+              </form>
+            ) : (
+              /* Sub-form B: Password Login */
+              <form onSubmit={handlePasswordLogin} className="space-y-3 text-left">
                 <div>
                   <label className="block font-sketch text-xs font-bold text-[#475569] uppercase tracking-wider mb-1">
                     Username or Email
@@ -509,7 +772,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
                       required
                       value={username}
                       onChange={(e) => setUsername(e.target.value)}
-                      placeholder="Username or pilot@example.com"
+                      placeholder="Username or email"
                       className="w-full pl-9 pr-3 py-2 bg-[#ffffff] border-2 border-[#2d2a26] rounded-xl font-sketch text-base font-bold text-[#1e293b] focus:outline-none focus:ring-2 focus:ring-[#facc15] shadow-[2px_2px_0px_#2d2a26]"
                     />
                   </div>
@@ -525,7 +788,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
                       onClick={() => switchTab('forgot')}
                       className="font-sketch text-xs font-bold text-[#0284c7] hover:underline cursor-pointer"
                     >
-                      Forgot username/password?
+                      Forgot?
                     </button>
                   </div>
                   <div className="relative">
@@ -552,74 +815,8 @@ export const AuthModal: React.FC<AuthModalProps> = ({
                   <ArrowRight size={18} />
                 </button>
               </form>
-            ) : (
-              /* Sub-form B: Passwordless Magic Link */
-              <form onSubmit={handleSendMagicLink} className="space-y-3 text-left">
-                <div>
-                  <label className="block font-sketch text-xs font-bold text-[#475569] uppercase tracking-wider mb-1">
-                    Your Email Address
-                  </label>
-                  <div className="relative">
-                    <span className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none text-[#64748b]">
-                      <Mail size={16} />
-                    </span>
-                    <input
-                      type="email"
-                      required
-                      value={magicLinkEmail}
-                      onChange={(e) => setMagicLinkEmail(e.target.value)}
-                      placeholder="pilot@example.com"
-                      className="w-full pl-9 pr-3 py-2 bg-[#ffffff] border-2 border-[#2d2a26] rounded-xl font-sketch text-base font-bold text-[#1e293b] focus:outline-none focus:ring-2 focus:ring-[#facc15] shadow-[2px_2px_0px_#2d2a26]"
-                    />
-                  </div>
-                  <p className="font-sketch text-[11px] text-[#64748b] mt-1">
-                    We will email you a secure 1-click link to sign in instantly without needing a password.
-                  </p>
-                </div>
-
-                <button
-                  type="submit"
-                  disabled={loading}
-                  className="w-full mt-2 py-3 bg-[#fde047] hover:bg-[#facc15] active:translate-x-0.5 active:translate-y-0.5 text-[#1e293b] font-sketch text-base sm:text-lg font-black border-2 border-[#2d2a26] rounded-xl shadow-[3px_3px_0px_#2d2a26] transition-all cursor-pointer flex items-center justify-center gap-2 disabled:opacity-50"
-                >
-                  <Send size={16} />
-                  <span>{loading ? 'Sending Magic Link...' : 'Email Me Sign-In Link'}</span>
-                </button>
-              </form>
             )}
           </div>
-        )}
-
-        {/* ─── TAB 3: CONFIRM EMAIL LINK (opened on different browser) ───── */}
-        {tab === 'email-confirm' && (
-          <form onSubmit={handleConfirmMagicLinkEmail} className="space-y-3 text-left">
-            <div>
-              <label className="block font-sketch text-xs font-bold text-[#475569] uppercase tracking-wider mb-1">
-                Confirm Your Email Address
-              </label>
-              <div className="relative">
-                <span className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none text-[#64748b]">
-                  <Mail size={16} />
-                </span>
-                <input
-                  type="email"
-                  required
-                  value={confirmEmail}
-                  onChange={(e) => setConfirmEmail(e.target.value)}
-                  placeholder="Enter the email you sent the link to"
-                  className="w-full pl-9 pr-3 py-2 bg-[#ffffff] border-2 border-[#2d2a26] rounded-xl font-sketch text-base font-bold text-[#1e293b] focus:outline-none focus:ring-2 focus:ring-[#facc15] shadow-[2px_2px_0px_#2d2a26]"
-                />
-              </div>
-            </div>
-
-            <button
-              type="submit"
-              disabled={loading}
-              className="w-full py-3 bg-[#fde047] hover:bg-[#facc15] text-[#1e293b] font-sketch text-lg font-black border-2 border-[#2d2a26] rounded-xl shadow-[3px_3px_0px_#2d2a26] cursor-pointer"
-            >
-              {loading ? 'Verifying Link...' : 'Complete Sign-In'}
-            </button>
-          </form>
         )}
 
         {/* ─── TAB 4: FORGOT USERNAME / PASSWORD ─────────────────────────── */}
@@ -661,20 +858,14 @@ export const AuthModal: React.FC<AuthModalProps> = ({
             <form onSubmit={handleForgotSubmit} className="space-y-3">
               <div>
                 <label className="block font-sketch text-xs font-bold text-[#475569] uppercase tracking-wider mb-1">
-                  {forgotSubTab === 'password'
-                    ? 'Enter Username or Recovery Email'
-                    : 'Enter Registered Recovery Email'}
+                  {forgotSubTab === 'password' ? 'Username or Email' : 'Registered Recovery Email'}
                 </label>
                 <input
                   type="text"
                   required
                   value={forgotInput}
                   onChange={(e) => setForgotInput(e.target.value)}
-                  placeholder={
-                    forgotSubTab === 'password'
-                      ? 'Username or pilot@example.com'
-                      : 'pilot@example.com'
-                  }
+                  placeholder={forgotSubTab === 'password' ? 'Username or email' : 'pilot@example.com'}
                   className="w-full px-3 py-2 bg-[#ffffff] border-2 border-[#2d2a26] rounded-xl font-sketch text-base font-bold text-[#1e293b] focus:outline-none focus:ring-2 focus:ring-[#facc15] shadow-[2px_2px_0px_#2d2a26]"
                 />
               </div>
@@ -702,10 +893,9 @@ export const AuthModal: React.FC<AuthModalProps> = ({
           </div>
         )}
 
-        {/* ─── TAB 5: CHOOSE USERNAME FOR GOOGLE / MAGIC LINK USER ───────── */}
+        {/* ─── TAB 5: CHOOSE USERNAME FOR GOOGLE USER ────────────────────── */}
         {tab === 'google-username' && (
           <div className="space-y-4 text-left">
-            {/* Google Authentication Confirmation Badge */}
             <div className="flex items-center gap-3 p-3 bg-[#f0fdf4] border-2 border-[#16a34a] rounded-xl shadow-[2px_2px_0px_#16a34a]">
               {pendingGooglePhoto ? (
                 <img
@@ -757,9 +947,6 @@ export const AuthModal: React.FC<AuthModalProps> = ({
                     className="w-full pl-9 pr-3 py-2.5 bg-[#ffffff] border-2 border-[#2d2a26] rounded-xl font-sketch text-base font-bold text-[#1e293b] focus:outline-none focus:ring-2 focus:ring-[#facc15] shadow-[2px_2px_0px_#2d2a26]"
                   />
                 </div>
-                <p className="font-sketch text-[11px] text-[#64748b] mt-1">
-                  Must be 3–24 characters. Letters, numbers, and dashes allowed.
-                </p>
               </div>
 
               <button
@@ -782,8 +969,8 @@ export const AuthModal: React.FC<AuthModalProps> = ({
           </div>
         )}
 
-        {/* ─── OR DIVIDER & GOOGLE LOGIN ─────────────────────────────────── */}
-        {tab !== 'google-username' && tab !== 'forgot' && tab !== 'email-confirm' && (
+        {/* ─── GOOGLE LOGIN & GUEST DIVIDER ──────────────────────────────── */}
+        {tab !== 'verify-code' && tab !== 'google-username' && tab !== 'forgot' && (
           <>
             <div className="relative my-4">
               <div className="absolute inset-0 flex items-center">
@@ -810,7 +997,6 @@ export const AuthModal: React.FC<AuthModalProps> = ({
                 </>
               ) : (
                 <>
-                  {/* Google "G" SVG */}
                   <svg width="18" height="18" viewBox="0 0 24 24">
                     <path
                       fill="#4285F4"
@@ -836,7 +1022,6 @@ export const AuthModal: React.FC<AuthModalProps> = ({
 
             {/* ─── GUEST WARNING & CONTINUE WITHOUT LOGIN ──────────────────── */}
             <div className="mt-5 pt-4 border-t border-[#e2e8f0]">
-              {/* Prominent Warning Callout */}
               <div className="bg-[#fef3c7] border-2 border-[#d97706] rounded-xl p-3 text-left mb-3 shadow-[2px_2px_0px_#d97706]">
                 <div className="flex items-start gap-2">
                   <span className="text-base sm:text-lg shrink-0">⚠️</span>
@@ -844,12 +1029,11 @@ export const AuthModal: React.FC<AuthModalProps> = ({
                     <span className="font-black uppercase tracking-wider block mb-0.5">
                       Notice: Without login, progress will not be saved!
                     </span>
-                    Your high score, unlocked gliders, and paperclips will only be saved locally in this browser. You won't be able to access your records from another device.
+                    Your high score, unlocked gliders, and paperclips will only be saved locally in this browser.
                   </div>
                 </div>
               </div>
 
-              {/* Continue without Login CTA */}
               <button
                 type="button"
                 onClick={onContinueAsGuest}
