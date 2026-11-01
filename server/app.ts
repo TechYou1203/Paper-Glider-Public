@@ -11,6 +11,14 @@ export const app = express();
 app.use(cors());
 app.use(express.json());
 
+// Restore originalUrl if rewritten by serverless host (Vercel)
+app.use((req, _res, next) => {
+  if (req.originalUrl && req.originalUrl !== req.url) {
+    req.url = req.originalUrl;
+  }
+  next();
+});
+
 // Health & Database Diagnostics check
 const handleHealth = async (_req: express.Request, res: express.Response) => {
   const isConfigured = databaseConfigured();

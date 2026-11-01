@@ -30178,6 +30178,12 @@ var inventory_default = router5;
 var app = (0, import_express6.default)();
 app.use((0, import_cors.default)());
 app.use(import_express6.default.json());
+app.use((req, _res, next) => {
+  if (req.originalUrl && req.originalUrl !== req.url) {
+    req.url = req.originalUrl;
+  }
+  next();
+});
 var handleHealth = async (_req, res) => {
   const isConfigured = databaseConfigured();
   let dbConnected = false;
@@ -30211,9 +30217,12 @@ app.use((err, _req, res, _next) => {
 });
 
 // server/api.ts
-var api_default = app;
+function handler(req, res) {
+  return app(req, res);
+}
 export {
-  api_default as default
+  app,
+  handler as default
 };
 /*! Bundled license information:
 
