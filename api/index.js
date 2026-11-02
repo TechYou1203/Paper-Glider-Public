@@ -42087,10 +42087,20 @@ router.post("/login", async (req, res) => {
 });
 router.post("/sync-pilot", async (req, res) => {
   try {
-    const { firebaseUid, callsign } = req.body || {};
+    const { firebaseUid, callsign, email, authProvider } = req.body || {};
     if (!firebaseUid || !callsign) {
       res.status(400).json({ error: "firebaseUid and callsign are required" });
       return;
+    }
+    const cleanEmail = email ? String(email).trim().toLowerCase() : null;
+    const provider = authProvider || "firebase";
+    if (provider === "google" && cleanEmail) {
+      await sql`
+        INSERT INTO google_accounts (email, firebase_uid, callsign, updated_at)
+        VALUES (${cleanEmail}, ${firebaseUid}, ${callsign}, NOW())
+        ON CONFLICT (email) DO UPDATE
+        SET firebase_uid = ${firebaseUid}, callsign = ${callsign}, updated_at = NOW()
+      `;
     }
     let rows = await sql`
       SELECT id, guest_token, callsign, equipped_skin, paperclips, unlocked_skins, sound_enabled
@@ -42098,14 +42108,15 @@ router.post("/sync-pilot", async (req, res) => {
       WHERE firebase_uid = ${firebaseUid}
     `;
     if (rows.length > 0) {
-      if (rows[0].callsign !== callsign) {
-        rows = await sql`
-          UPDATE players
-          SET callsign = ${callsign}, updated_at = NOW()
-          WHERE firebase_uid = ${firebaseUid}
-          RETURNING id, guest_token, callsign, equipped_skin, paperclips, unlocked_skins, sound_enabled
-        `;
-      }
+      rows = await sql`
+        UPDATE players
+        SET callsign = ${callsign},
+            email = COALESCE(${cleanEmail}, email),
+            auth_provider = COALESCE(${provider}, auth_provider),
+            updated_at = NOW()
+        WHERE firebase_uid = ${firebaseUid}
+        RETURNING id, guest_token, callsign, equipped_skin, paperclips, unlocked_skins, sound_enabled
+      `;
       const player2 = rows[0];
       res.json({
         token: player2.guest_token,
@@ -42122,8 +42133,8 @@ router.post("/sync-pilot", async (req, res) => {
     }
     const guestToken = crypto9.randomUUID();
     rows = await sql`
-      INSERT INTO players (guest_token, firebase_uid, callsign)
-      VALUES (${guestToken}, ${firebaseUid}, ${callsign})
+      INSERT INTO players (guest_token, firebase_uid, callsign, email, auth_provider)
+      VALUES (${guestToken}, ${firebaseUid}, ${callsign}, ${cleanEmail}, ${provider})
       RETURNING id, guest_token, callsign, equipped_skin, paperclips, unlocked_skins, sound_enabled
     `;
     const player = rows[0];
@@ -42143,6 +42154,60 @@ router.post("/sync-pilot", async (req, res) => {
     res.status(500).json({ error: "Failed to sync pilot account" });
   }
 });
+router.get("/check-google", async (req, res) => {
+  try {
+    const email = req.query.email?.trim().toLowerCase();
+    const identifier = req.query.identifier?.trim().toLowerCase();
+    const queryVal = email || identifier;
+    if (!queryVal) {
+      res.json({ isGoogle: false });
+      return;
+    }
+    if (queryVal.includes("@")) {
+      const rows = await sql`
+        SELECT email FROM google_accounts
+        WHERE LOWER(email) = LOWER(${queryVal})
+        LIMIT 1
+      `;
+      if (rows.length > 0) {
+        res.json({ isGoogle: true, message: "This account is registered with Google. Try signing in with Google." });
+        return;
+      }
+      const pRows = await sql`
+        SELECT id FROM players
+        WHERE LOWER(email) = LOWER(${queryVal}) AND auth_provider = 'google'
+        LIMIT 1
+      `;
+      if (pRows.length > 0) {
+        res.json({ isGoogle: true, message: "This account is registered with Google. Try signing in with Google." });
+        return;
+      }
+    } else {
+      const rows = await sql`
+        SELECT email FROM google_accounts
+        WHERE LOWER(callsign) = LOWER(${queryVal})
+        LIMIT 1
+      `;
+      if (rows.length > 0) {
+        res.json({ isGoogle: true, message: "This account is registered with Google. Try signing in with Google." });
+        return;
+      }
+      const pRows = await sql`
+        SELECT id FROM players
+        WHERE LOWER(callsign) = LOWER(${queryVal}) AND auth_provider = 'google'
+        LIMIT 1
+      `;
+      if (pRows.length > 0) {
+        res.json({ isGoogle: true, message: "This account is registered with Google. Try signing in with Google." });
+        return;
+      }
+    }
+    res.json({ isGoogle: false });
+  } catch (err) {
+    console.error("Check google error:", err);
+    res.json({ isGoogle: false });
+  }
+});
 router.post("/send-verification-code", async (req, res) => {
   try {
     const { email, username, type = "signup" } = req.body || {};
@@ -42158,6 +42223,32 @@ router.post("/send-verification-code", async (req, res) => {
     }
     if (!/^[a-zA-Z0-9_-]+$/.test(cleanUsername)) {
       res.status(400).json({ error: "Username can only contain letters, numbers, underscores, and dashes." });
+      return;
+    }
+    const googleCheck = await sql`
+      SELECT email FROM google_accounts
+      WHERE LOWER(email) = LOWER(${trimmedEmail})
+         OR LOWER(callsign) = LOWER(${cleanUsername})
+      LIMIT 1
+    `;
+    if (googleCheck.length > 0) {
+      res.status(400).json({
+        error: "This account is registered with Google. Try signing in with Google.",
+        isGoogle: true
+      });
+      return;
+    }
+    const playerGoogleCheck = await sql`
+      SELECT id FROM players
+      WHERE (LOWER(email) = LOWER(${trimmedEmail}) OR LOWER(callsign) = LOWER(${cleanUsername}))
+        AND auth_provider = 'google'
+      LIMIT 1
+    `;
+    if (playerGoogleCheck.length > 0) {
+      res.status(400).json({
+        error: "This account is registered with Google. Try signing in with Google.",
+        isGoogle: true
+      });
       return;
     }
     if (type === "signup") {
@@ -42276,8 +42367,19 @@ router.delete("/account", async (req, res) => {
       WHERE (firebase_uid IS NOT NULL AND firebase_uid = ${firebaseUid || ""})
          OR (guest_token IS NOT NULL AND guest_token = ${activeToken || ""})
          OR (callsign IS NOT NULL AND callsign = ${callsign || ""})
-      RETURNING id, callsign
+      RETURNING id, callsign, firebase_uid, email
     `;
+    if (firebaseUid || callsign) {
+      await sql`
+        DELETE FROM google_accounts
+        WHERE (firebase_uid IS NOT NULL AND firebase_uid = ${firebaseUid || ""})
+           OR (callsign IS NOT NULL AND callsign = ${callsign || ""})
+      `;
+      await sql`
+        DELETE FROM verification_codes
+        WHERE (username IS NOT NULL AND username = ${callsign || ""})
+      `;
+    }
     res.json({
       success: true,
       deletedCount: deleted.length,
@@ -42303,7 +42405,7 @@ async function authMiddleware(req, res, next) {
   const token = authHeader.slice(7);
   try {
     const rows = await sql`
-      SELECT id, callsign, equipped_skin, paperclips, unlocked_skins, sound_enabled
+      SELECT id, callsign, equipped_skin, paperclips, unlocked_skins, sound_enabled, firebase_uid, email, auth_provider
       FROM players
       WHERE guest_token = ${token}
     `;
@@ -42318,7 +42420,11 @@ async function authMiddleware(req, res, next) {
       equippedSkin: player.equipped_skin,
       paperclips: player.paperclips,
       unlockedSkins: player.unlocked_skins,
-      soundEnabled: player.sound_enabled
+      soundEnabled: player.sound_enabled,
+      firebaseUid: player.firebase_uid || null,
+      email: player.email || null,
+      authProvider: player.auth_provider || "guest",
+      isGuest: !player.firebase_uid
     };
     next();
   } catch (error2) {
@@ -42335,7 +42441,7 @@ async function optionalAuth(req, res, next) {
   const token = authHeader.slice(7);
   try {
     const rows = await sql`
-      SELECT id, callsign, equipped_skin, paperclips, unlocked_skins, sound_enabled
+      SELECT id, callsign, equipped_skin, paperclips, unlocked_skins, sound_enabled, firebase_uid, email, auth_provider
       FROM players
       WHERE guest_token = ${token}
     `;
@@ -42347,7 +42453,11 @@ async function optionalAuth(req, res, next) {
         equippedSkin: player.equipped_skin,
         paperclips: player.paperclips,
         unlockedSkins: player.unlocked_skins,
-        soundEnabled: player.sound_enabled
+        soundEnabled: player.sound_enabled,
+        firebaseUid: player.firebase_uid || null,
+        email: player.email || null,
+        authProvider: player.auth_provider || "guest",
+        isGuest: !player.firebase_uid
       };
     }
   } catch (error2) {
@@ -42362,9 +42472,11 @@ router2.get("/", optionalAuth, async (req, res) => {
   try {
     const limit = Math.min(Math.max(parseInt(req.query.limit) || 100, 1), 500);
     const rows = await sql`
-      SELECT id, player_id, callsign, score, clips, skin, achieved_at
-      FROM leaderboard
-      ORDER BY score DESC, clips DESC, achieved_at ASC
+      SELECT l.id, l.player_id, l.callsign, l.score, l.clips, l.skin, l.achieved_at
+      FROM leaderboard l
+      JOIN players p ON l.player_id = p.id
+      WHERE p.firebase_uid IS NOT NULL
+      ORDER BY l.score DESC, l.clips DESC, l.achieved_at ASC
       LIMIT ${limit}
     `;
     const entries = rows.map((row, index) => ({
@@ -42387,10 +42499,12 @@ router2.get("/daily", optionalAuth, async (req, res) => {
   try {
     const limit = Math.min(Math.max(parseInt(req.query.limit) || 100, 1), 500);
     const rows = await sql`
-      SELECT id, player_id, callsign, score, clips, skin, achieved_at
-      FROM leaderboard
-      WHERE achieved_at >= CURRENT_DATE
-      ORDER BY score DESC, clips DESC, achieved_at ASC
+      SELECT l.id, l.player_id, l.callsign, l.score, l.clips, l.skin, l.achieved_at
+      FROM leaderboard l
+      JOIN players p ON l.player_id = p.id
+      WHERE p.firebase_uid IS NOT NULL
+        AND l.achieved_at >= CURRENT_DATE
+      ORDER BY l.score DESC, l.clips DESC, l.achieved_at ASC
       LIMIT ${limit}
     `;
     const entries = rows.map((row, index) => ({
@@ -43122,10 +43236,11 @@ var router3 = (0, import_express3.Router)();
 router3.post("/start", authMiddleware, async (req, res) => {
   try {
     const player = req.player;
-    const seed = crypto10.randomUUID();
+    const seed = req.body?.seed && typeof req.body.seed === "string" && req.body.seed.length > 5 ? req.body.seed : crypto10.randomUUID();
+    const skinUsed = req.body?.skinUsed || player.equippedSkin || "classic";
     const rows = await sql`
       INSERT INTO flights (player_id, seed, skin_used)
-      VALUES (${player.id}, ${seed}, ${player.equippedSkin})
+      VALUES (${player.id}, ${seed}, ${skinUsed})
       RETURNING id
     `;
     const flight = rows[0];
@@ -43196,8 +43311,24 @@ router3.post("/:id/submit", authMiddleware, async (req, res) => {
           verified = true
       WHERE id = ${flightId}
     `;
+    await sql`
+      UPDATE players
+      SET paperclips = paperclips + ${clipsCount}, updated_at = NOW()
+      WHERE id = ${player.id}
+    `;
+    const isPlayerSignedIn = !player.isGuest && Boolean(player.firebaseUid);
+    if (!isPlayerSignedIn) {
+      res.json({
+        verified: true,
+        score: verifiedScore,
+        rank: null,
+        isGuest: true,
+        message: "Flight recorded! Sign in to join the official Global Leaderboard."
+      });
+      return;
+    }
     const existingLb = await sql`
-      SELECT id, score FROM leaderboard
+      SELECT id, score, clips FROM leaderboard
       WHERE player_id = ${player.id}
     `;
     if (existingLb.length === 0) {
@@ -43205,7 +43336,7 @@ router3.post("/:id/submit", authMiddleware, async (req, res) => {
         INSERT INTO leaderboard (player_id, callsign, score, clips, skin, flight_id)
         VALUES (${player.id}, ${player.callsign}, ${verifiedScore}, ${clipsCount}, ${player.equippedSkin}, ${flightId})
       `;
-    } else if (verifiedScore > existingLb[0].score || verifiedScore === existingLb[0].score && clipsCount > existingLb[0].clips) {
+    } else if (verifiedScore > existingLb[0].score || verifiedScore === existingLb[0].score && clipsCount > (existingLb[0].clips || 0)) {
       await sql`
         UPDATE leaderboard
         SET score = ${verifiedScore}, clips = GREATEST(clips, ${clipsCount}), skin = ${player.equippedSkin},
@@ -43213,27 +43344,112 @@ router3.post("/:id/submit", authMiddleware, async (req, res) => {
         WHERE player_id = ${player.id}
       `;
     }
-    await sql`
-      UPDATE players
-      SET paperclips = paperclips + ${clipsCount}, updated_at = NOW()
-      WHERE id = ${player.id}
-    `;
     const rankRows = await sql`
       SELECT COUNT(*) + 1 AS rank
-      FROM leaderboard
-      WHERE score > (
-        SELECT COALESCE(MAX(score), 0) FROM leaderboard WHERE player_id = ${player.id}
-      )
+      FROM leaderboard l
+      JOIN players p ON l.player_id = p.id
+      WHERE p.firebase_uid IS NOT NULL
+        AND l.score > (
+          SELECT COALESCE(MAX(score), 0) FROM leaderboard WHERE player_id = ${player.id}
+        )
     `;
     const rank = parseInt(rankRows[0].rank);
     res.json({
       verified: true,
       score: verifiedScore,
-      rank
+      rank,
+      isGuest: false
     });
   } catch (error2) {
     console.error("Flight submit error:", error2);
     res.status(500).json({ error: "Failed to submit flight" });
+  }
+});
+router3.post("/direct-submit", authMiddleware, async (req, res) => {
+  try {
+    const player = req.player;
+    const { seed, score, clipsCollected, inputs, durationMs, skinUsed, worldWidth, worldHeight } = req.body;
+    if (score == null || !Array.isArray(inputs) || !seed) {
+      res.status(400).json({ error: "Missing required fields: seed, score, inputs" });
+      return;
+    }
+    const actualSkin = skinUsed || player.equippedSkin || "classic";
+    const replayResult = verifyReplay(
+      seed,
+      inputs,
+      score,
+      actualSkin,
+      Number(worldWidth) || 800,
+      Number(worldHeight) || 600
+    );
+    const clipsCount = clipsCollected || 0;
+    const flightRows = await sql`
+      INSERT INTO flights (player_id, seed, score, clips_collected, skin_used, input_log, verified, duration_ms)
+      VALUES (${player.id}, ${seed}, ${replayResult.replayScore}, ${clipsCount}, ${actualSkin}, ${JSON.stringify(inputs)}, ${replayResult.valid}, ${durationMs || 0})
+      RETURNING id
+    `;
+    const flightId = flightRows[0].id;
+    if (!replayResult.valid) {
+      res.json({
+        verified: false,
+        score: replayResult.replayScore,
+        message: "Score verification failed"
+      });
+      return;
+    }
+    const verifiedScore = replayResult.replayScore;
+    await sql`
+      UPDATE players
+      SET paperclips = paperclips + ${clipsCount}, updated_at = NOW()
+      WHERE id = ${player.id}
+    `;
+    const isPlayerSignedIn = !player.isGuest && Boolean(player.firebaseUid);
+    if (!isPlayerSignedIn) {
+      res.json({
+        verified: true,
+        score: verifiedScore,
+        rank: null,
+        isGuest: true,
+        message: "Flight recorded! Sign in to join the official Global Leaderboard."
+      });
+      return;
+    }
+    const existingLb = await sql`
+      SELECT id, score, clips FROM leaderboard
+      WHERE player_id = ${player.id}
+    `;
+    if (existingLb.length === 0) {
+      await sql`
+        INSERT INTO leaderboard (player_id, callsign, score, clips, skin, flight_id)
+        VALUES (${player.id}, ${player.callsign}, ${verifiedScore}, ${clipsCount}, ${actualSkin}, ${flightId})
+      `;
+    } else if (verifiedScore > existingLb[0].score || verifiedScore === existingLb[0].score && clipsCount > (existingLb[0].clips || 0)) {
+      await sql`
+        UPDATE leaderboard
+        SET score = ${verifiedScore}, clips = GREATEST(clips, ${clipsCount}), skin = ${actualSkin},
+            flight_id = ${flightId}, callsign = ${player.callsign}, achieved_at = NOW()
+        WHERE player_id = ${player.id}
+      `;
+    }
+    const rankRows = await sql`
+      SELECT COUNT(*) + 1 AS rank
+      FROM leaderboard l
+      JOIN players p ON l.player_id = p.id
+      WHERE p.firebase_uid IS NOT NULL
+        AND l.score > (
+          SELECT COALESCE(MAX(score), 0) FROM leaderboard WHERE player_id = ${player.id}
+        )
+    `;
+    const rank = parseInt(rankRows[0].rank);
+    res.json({
+      verified: true,
+      score: verifiedScore,
+      rank,
+      isGuest: false
+    });
+  } catch (error2) {
+    console.error("Direct flight submit error:", error2);
+    res.status(500).json({ error: "Failed to submit flight directly" });
   }
 });
 var flights_default = router3;

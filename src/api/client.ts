@@ -12,7 +12,7 @@ import type {
   DailyChallenge,
 } from '../game/types';
 
-const API_BASE = '/api';
+const API_BASE = typeof window !== 'undefined' ? '/api' : 'http://localhost:3001/api';
 const TOKEN_KEY = 'paper_glider_auth_token';
 
 let cachedToken: string | null = null;
@@ -284,10 +284,15 @@ export async function reconnectServer(callsign?: string): Promise<ServerPlayer |
 /**
  * Sync signed-in Firebase pilot with Neon DB.
  */
-export async function syncPilotAccount(firebaseUid: string, callsign: string): Promise<ServerPlayer | null> {
+export async function syncPilotAccount(
+  firebaseUid: string,
+  callsign: string,
+  email?: string,
+  authProvider?: string
+): Promise<ServerPlayer | null> {
   const data = await apiFetch<{ token: string; player: ServerPlayer }>('/auth/sync-pilot', {
     method: 'POST',
-    body: JSON.stringify({ firebaseUid, callsign }),
+    body: JSON.stringify({ firebaseUid, callsign, email, authProvider }),
   });
   if (data?.token) {
     setToken(data.token);
@@ -295,6 +300,20 @@ export async function syncPilotAccount(firebaseUid: string, callsign: string): P
     return data.player;
   }
   return null;
+}
+
+/**
+ * Check if an email or username is registered via Google.
+ */
+export async function checkIsGoogleAccount(identifier: string): Promise<boolean> {
+  try {
+    const data = await apiFetch<{ isGoogle: boolean; message?: string }>(
+      `/auth/check-google?identifier=${encodeURIComponent(identifier)}`
+    );
+    return Boolean(data?.isGoogle);
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -395,9 +414,10 @@ export async function verifyAuthCode(
 
 // ─── Flights ────────────────────────────────────────────────
 
-export async function startFlight(): Promise<FlightStartResponse | null> {
+export async function startFlight(seed?: string, skinUsed?: string): Promise<FlightStartResponse | null> {
   return apiFetch<FlightStartResponse>('/flights/start', {
     method: 'POST',
+    body: JSON.stringify({ seed, skinUsed }),
   });
 }
 
@@ -413,6 +433,22 @@ export async function submitFlight(
   return apiFetch<FlightSubmitResponse>(`/flights/${sessionId}/submit`, {
     method: 'POST',
     body: JSON.stringify({ score, clipsCollected, inputs, durationMs, worldWidth, worldHeight }),
+  });
+}
+
+export async function submitFlightDirect(
+  seed: string,
+  score: number,
+  clipsCollected: number,
+  inputs: FlightInput[],
+  durationMs: number,
+  skinUsed?: string,
+  worldWidth?: number,
+  worldHeight?: number
+): Promise<FlightSubmitResponse | null> {
+  return apiFetch<FlightSubmitResponse>('/flights/direct-submit', {
+    method: 'POST',
+    body: JSON.stringify({ seed, score, clipsCollected, inputs, durationMs, skinUsed, worldWidth, worldHeight }),
   });
 }
 

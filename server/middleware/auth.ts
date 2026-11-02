@@ -9,6 +9,10 @@ export interface AuthenticatedRequest extends Request {
     paperclips: number;
     unlockedSkins: string[];
     soundEnabled: boolean;
+    firebaseUid?: string | null;
+    email?: string | null;
+    authProvider?: string | null;
+    isGuest: boolean;
   };
 }
 
@@ -28,7 +32,7 @@ export async function authMiddleware(
 
   try {
     const rows = await sql`
-      SELECT id, callsign, equipped_skin, paperclips, unlocked_skins, sound_enabled
+      SELECT id, callsign, equipped_skin, paperclips, unlocked_skins, sound_enabled, firebase_uid, email, auth_provider
       FROM players
       WHERE guest_token = ${token}
     `;
@@ -46,6 +50,10 @@ export async function authMiddleware(
       paperclips: player.paperclips,
       unlockedSkins: player.unlocked_skins,
       soundEnabled: player.sound_enabled,
+      firebaseUid: player.firebase_uid || null,
+      email: player.email || null,
+      authProvider: player.auth_provider || 'guest',
+      isGuest: !player.firebase_uid,
     };
 
     next();
@@ -71,7 +79,7 @@ export async function optionalAuth(
 
   try {
     const rows = await sql`
-      SELECT id, callsign, equipped_skin, paperclips, unlocked_skins, sound_enabled
+      SELECT id, callsign, equipped_skin, paperclips, unlocked_skins, sound_enabled, firebase_uid, email, auth_provider
       FROM players
       WHERE guest_token = ${token}
     `;
@@ -85,6 +93,10 @@ export async function optionalAuth(
         paperclips: player.paperclips,
         unlockedSkins: player.unlocked_skins,
         soundEnabled: player.sound_enabled,
+        firebaseUid: player.firebase_uid || null,
+        email: player.email || null,
+        authProvider: player.auth_provider || 'guest',
+        isGuest: !player.firebase_uid,
       };
     }
   } catch (error) {

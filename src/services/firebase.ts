@@ -26,6 +26,7 @@ import {
   isSignInWithEmailLink,
   signInWithEmailLink,
   deleteUser,
+  fetchSignInMethodsForEmail,
   type Auth,
   type User,
 } from 'firebase/auth';
@@ -44,6 +45,7 @@ import {
   type Firestore,
 } from 'firebase/firestore';
 import type { PilotUser, UserStats } from '../game/types';
+import { checkIsGoogleAccount, syncPilotAccount } from '../api/client';
 
 // Safely read Vite or Node environment variables
 const env: Record<string, string | undefined> =
@@ -214,6 +216,74 @@ function saveLocalUsers(users: Record<string, LocalUserRecord>) {
   } catch {}
 }
 
+// ─── Google Registered Accounts Registry ─────────────────────────────────────
+
+const GOOGLE_EMAILS_KEY = 'paper_glider_google_emails';
+
+export function getRecordedGoogleEmails(): string[] {
+  try {
+    const raw = safeGetItem(GOOGLE_EMAILS_KEY);
+    return raw ? JSON.parse(raw) : [];
+  } catch {
+    return [];
+  }
+}
+
+export function recordGoogleEmail(email: string): void {
+  try {
+    const norm = email.trim().toLowerCase();
+    if (!norm) return;
+    const list = getRecordedGoogleEmails();
+    if (!list.includes(norm)) {
+      list.push(norm);
+      safeSetItem(GOOGLE_EMAILS_KEY, JSON.stringify(list));
+    }
+  } catch {}
+}
+
+export async function isGoogleRegisteredEmail(identifier: string): Promise<boolean> {
+  const norm = identifier.trim().toLowerCase();
+  if (!norm) return false;
+
+  // 1. Check local storage recorded Google emails
+  const recorded = getRecordedGoogleEmails();
+  if (recorded.includes(norm)) return true;
+
+  // 2. Check local users registry (Google users have blank passwordHash)
+  const localUsers = getLocalUsers();
+  for (const key in localUsers) {
+    const u = localUsers[key];
+    if (
+      (u.email?.toLowerCase() === norm || u.username?.toLowerCase() === norm) &&
+      u.passwordHash === ''
+    ) {
+      return true;
+    }
+  }
+
+  // 3. Check server Neon DB
+  try {
+    const serverIsGoogle = await checkIsGoogleAccount(norm);
+    if (serverIsGoogle) {
+      if (norm.includes('@')) recordGoogleEmail(norm);
+      return true;
+    }
+  } catch {}
+
+  // 4. Check Firebase Auth methods if available
+  if (auth && norm.includes('@') && isFirebaseConfigured) {
+    try {
+      const methods = await fetchSignInMethodsForEmail(auth, norm);
+      if (methods.includes('google.com') && !methods.includes('password')) {
+        recordGoogleEmail(norm);
+        return true;
+      }
+    } catch {}
+  }
+
+  return false;
+}
+
 // ─── Username Utilities ──────────────────────────────────────────────────────
 
 export function normalizeUsername(username: string): string {
@@ -286,6 +356,15 @@ export async function completeVerifiedEmailAuth(
   const trimmedEmail = email.trim().toLowerCase();
   const norm = normalizeUsername(trimmedUser);
   const pass = password || `pilot_${norm}_pg2026!`;
+
+  // Disallow if this account is registered with Google
+  const isGoogle = await isGoogleRegisteredEmail(trimmedEmail);
+  if (isGoogle) {
+    return {
+      success: false,
+      error: 'This account is registered with Google. Try signing in with Google.',
+    };
+  }
 
   if (auth && isFirebaseConfigured) {
     try {
@@ -389,6 +468,17 @@ export async function registerWithUsername(
   }
   if (!password || password.length < 6) {
     return { success: false, error: 'Password must be at least 6 characters long.' };
+  }
+
+  // Check if recovery email is already registered with Google
+  if (recoveryEmail) {
+    const isGoogle = await isGoogleRegisteredEmail(recoveryEmail);
+    if (isGoogle) {
+      return {
+        success: false,
+        error: 'This account is registered with Google. Try signing in with Google.',
+      };
+    }
   }
 
   // 1. Verify username uniqueness
@@ -510,10 +600,19 @@ export async function loginWithUsername(
     return { success: false, error: 'Please enter your password.' };
   }
 
+  // Reject immediately if the identifier belongs to a Google-registered account
+  const isGoogle = await isGoogleRegisteredEmail(trimmed);
+  if (isGoogle) {
+    return {
+      success: false,
+      error: 'This account is registered with Google. Try signing in with Google.',
+    };
+  }
+
   // 1. Real Firebase Auth flow
   if (auth && isFirebaseConfigured) {
+    let targetEmail = trimmed;
     try {
-      let targetEmail = trimmed;
       let actualUsername = trimmed;
 
       if (trimmed.includes('@')) {
@@ -588,6 +687,13 @@ export async function loginWithUsername(
       }
     } catch (err: any) {
       if (err.code === 'auth/wrong-password' || err.code === 'auth/invalid-credential') {
+        const isGoogleAccount = await isGoogleRegisteredEmail(targetEmail || trimmed);
+        if (isGoogleAccount) {
+          return {
+            success: false,
+            error: 'This account is registered with Google. Try signing in with Google.',
+          };
+        }
         return { success: false, error: 'Incorrect password. Please try again.' };
       }
       if (err.code === 'auth/user-not-found') {
@@ -613,6 +719,13 @@ export async function loginWithUsername(
     return { success: false, error: 'Username or email not found. Please register an account.' };
   }
 
+  if (record.passwordHash === '') {
+    return {
+      success: false,
+      error: 'This account is registered with Google. Try signing in with Google.',
+    };
+  }
+
   if (record.passwordHash !== btoa(password)) {
     return { success: false, error: 'Incorrect password. Please try again.' };
   }
@@ -636,6 +749,10 @@ export async function loginWithGoogle(): Promise<AuthResult> {
     try {
       const cred = await signInWithPopup(auth, googleProvider);
       const user = cred.user;
+
+      if (user.email) {
+        recordGoogleEmail(user.email);
+      }
 
       // Extract best suggested username
       let suggestedUsername = user.displayName?.trim() || '';
@@ -792,6 +909,13 @@ export async function completeGoogleRegistration(
     createdAt: localUsers[norm]?.createdAt ?? new Date().toISOString(),
   };
   saveLocalUsers(localUsers);
+
+  if (effectiveEmail) {
+    recordGoogleEmail(effectiveEmail);
+  }
+
+  // Sync pilot account with Neon DB as google auth provider
+  syncPilotAccount(uid, trimmed, effectiveEmail, 'google').catch(() => {});
 
   const pilotUser: PilotUser = {
     uid,

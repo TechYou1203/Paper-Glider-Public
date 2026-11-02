@@ -57,6 +57,7 @@ import {
   reconnectServerWithDetails,
   startFlight as apiStartFlight,
   submitFlight as apiSubmitFlight,
+  submitFlightDirect as apiSubmitFlightDirect,
   syncPilotAccount,
   unlockSkin as apiUnlockSkin,
   updateSettings as apiUpdateSettings,
@@ -417,51 +418,73 @@ export default function App() {
     saveUserStats(updatedStats);
     setChallenges(updatedChallenges);
 
+    const isGuest = !currentUser || (typeof window !== 'undefined' && localStorage.getItem('paper_glider_is_guest') === 'true');
+
     // Sync stats to cloud if logged in
     if (currentUser) {
       syncCloudStats(currentUser.uid, updatedStats).catch(() => {});
     }
 
     // Submit to server for anti-cheat verification asynchronously
-    if (simState.flightSessionId) {
-      apiSubmitFlight(
-        simState.flightSessionId,
+    const submitPromise = simState.flightSessionId
+      ? apiSubmitFlight(
+          simState.flightSessionId,
+          finalScore,
+          finalClips,
+          simState.inputs,
+          durationMs,
+          sim.worldWidth,
+          sim.worldHeight
+        )
+      : apiSubmitFlightDirect(
+          sim.seed,
+          finalScore,
+          finalClips,
+          simState.inputs,
+          durationMs,
+          simState.skin.id,
+          sim.worldWidth,
+          sim.worldHeight
+        );
+
+    submitPromise.then((res) => {
+      if (res?.verified) {
+        if (!isGuest && res.rank != null) {
+          setVerifiedRank(res.rank);
+        } else {
+          setVerifiedRank(null);
+        }
+
+        apiFetchLeaderboard(100).then((lb) => {
+          if (lb && lb.length > 0) {
+            const mapped: LeaderboardEntry[] = lb.map((e) => ({
+              id: `server-${e.rank}`,
+              callsign: e.callsign,
+              score: e.score,
+              clips: e.clips,
+              date: e.achievedAt ? e.achievedAt.split('T')[0] : getTodayDateString(),
+              planeSkin: e.skin || 'classic',
+              country: '🌐',
+              isPlayer: e.isPlayer,
+            }));
+            setLeaderboard(mapped);
+          }
+        });
+      }
+    }).catch(() => {});
+
+    // Only save progress and store rank on the leaderboard for signed-in players!
+    if (!isGuest) {
+      const updatedLb = recordScoreToLeaderboard(
+        updatedStats.callsign,
         finalScore,
         finalClips,
-        simState.inputs,
-        durationMs,
-        sim.worldWidth,
-        sim.worldHeight
-      ).then((res) => {
-        if (res?.verified) {
-          setVerifiedRank(res.rank);
-          apiFetchLeaderboard(100).then((lb) => {
-            if (lb && lb.length > 0) {
-              const mapped: LeaderboardEntry[] = lb.map((e) => ({
-                id: `server-${e.rank}`,
-                callsign: e.callsign,
-                score: e.score,
-                clips: e.clips,
-                date: e.achievedAt ? e.achievedAt.split('T')[0] : getTodayDateString(),
-                planeSkin: e.skin || 'classic',
-                country: '🌐',
-                isPlayer: e.isPlayer,
-              }));
-              setLeaderboard(mapped);
-            }
-          });
-        }
-      }).catch(() => {});
+        simState.skin.id
+      );
+      setLeaderboard(updatedLb);
+    } else {
+      setVerifiedRank(null);
     }
-
-    // Always update local leaderboard fallback
-    const updatedLb = recordScoreToLeaderboard(
-      updatedStats.callsign,
-      finalScore,
-      finalClips,
-      simState.skin.id
-    );
-    setLeaderboard(updatedLb);
 
     // Transition to game over screen smoothly
     setTimeout(() => {
@@ -502,8 +525,8 @@ export default function App() {
     sound.playClick();
     sound.startAmbient();
 
-    // Request authoritative session from server in background
-    apiStartFlight().then((serverSession) => {
+    // Request authoritative session from server with identical seed & skin
+    apiStartFlight(seed, selectedSkin.id).then((serverSession) => {
       if (serverSession) {
         simRef.current.flightSessionId = serverSession.sessionId;
         setIsOnline(true);
@@ -867,7 +890,12 @@ export default function App() {
 
     // Synchronize pilot callsign & firebase UID with Neon database
     try {
-      const player = await syncPilotAccount(user.uid, user.username);
+      const player = await syncPilotAccount(
+        user.uid,
+        user.username,
+        user.email,
+        user.email ? 'firebase' : 'guest'
+      );
       if (player) {
         setIsOnline(true);
         setUserStats((prev) => {
@@ -1116,6 +1144,8 @@ export default function App() {
           userHighScore={userStats.highScore}
           onClose={() => setShowLeaderboard(false)}
           isOnline={isOnline}
+          isGuest={!currentUser}
+          onOpenAuth={() => setShowAuthModal(true)}
         />
       )}
 

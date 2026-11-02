@@ -80,10 +80,23 @@ router.post('/login', async (req: Request, res: Response) => {
 // POST /api/auth/sync-pilot — Link or get Neon player for a Firebase pilot
 router.post('/sync-pilot', async (req: Request, res: Response) => {
   try {
-    const { firebaseUid, callsign } = req.body || {};
+    const { firebaseUid, callsign, email, authProvider } = req.body || {};
     if (!firebaseUid || !callsign) {
       res.status(400).json({ error: 'firebaseUid and callsign are required' });
       return;
+    }
+
+    const cleanEmail = email ? String(email).trim().toLowerCase() : null;
+    const provider = authProvider || 'firebase';
+
+    // If signed in with Google, register in google_accounts registry
+    if (provider === 'google' && cleanEmail) {
+      await sql`
+        INSERT INTO google_accounts (email, firebase_uid, callsign, updated_at)
+        VALUES (${cleanEmail}, ${firebaseUid}, ${callsign}, NOW())
+        ON CONFLICT (email) DO UPDATE
+        SET firebase_uid = ${firebaseUid}, callsign = ${callsign}, updated_at = NOW()
+      `;
     }
 
     // 1. Look for existing record by firebase_uid
@@ -94,14 +107,15 @@ router.post('/sync-pilot', async (req: Request, res: Response) => {
     `;
 
     if (rows.length > 0) {
-      if (rows[0].callsign !== callsign) {
-        rows = await sql`
-          UPDATE players
-          SET callsign = ${callsign}, updated_at = NOW()
-          WHERE firebase_uid = ${firebaseUid}
-          RETURNING id, guest_token, callsign, equipped_skin, paperclips, unlocked_skins, sound_enabled
-        `;
-      }
+      rows = await sql`
+        UPDATE players
+        SET callsign = ${callsign},
+            email = COALESCE(${cleanEmail}, email),
+            auth_provider = COALESCE(${provider}, auth_provider),
+            updated_at = NOW()
+        WHERE firebase_uid = ${firebaseUid}
+        RETURNING id, guest_token, callsign, equipped_skin, paperclips, unlocked_skins, sound_enabled
+      `;
       const player = rows[0];
       res.json({
         token: player.guest_token,
@@ -120,8 +134,8 @@ router.post('/sync-pilot', async (req: Request, res: Response) => {
     // 2. Not found by firebase_uid; insert new linked pilot
     const guestToken = crypto.randomUUID();
     rows = await sql`
-      INSERT INTO players (guest_token, firebase_uid, callsign)
-      VALUES (${guestToken}, ${firebaseUid}, ${callsign})
+      INSERT INTO players (guest_token, firebase_uid, callsign, email, auth_provider)
+      VALUES (${guestToken}, ${firebaseUid}, ${callsign}, ${cleanEmail}, ${provider})
       RETURNING id, guest_token, callsign, equipped_skin, paperclips, unlocked_skins, sound_enabled
     `;
 
@@ -140,6 +154,67 @@ router.post('/sync-pilot', async (req: Request, res: Response) => {
   } catch (error) {
     console.error('Sync pilot error:', error);
     res.status(500).json({ error: 'Failed to sync pilot account' });
+  }
+});
+
+// GET /api/auth/check-google — Check if email or username is registered via Google
+router.get('/check-google', async (req: Request, res: Response) => {
+  try {
+    const email = (req.query.email as string)?.trim().toLowerCase();
+    const identifier = (req.query.identifier as string)?.trim().toLowerCase();
+
+    const queryVal = email || identifier;
+    if (!queryVal) {
+      res.json({ isGoogle: false });
+      return;
+    }
+
+    if (queryVal.includes('@')) {
+      const rows = await sql`
+        SELECT email FROM google_accounts
+        WHERE LOWER(email) = LOWER(${queryVal})
+        LIMIT 1
+      `;
+      if (rows.length > 0) {
+        res.json({ isGoogle: true, message: 'This account is registered with Google. Try signing in with Google.' });
+        return;
+      }
+
+      const pRows = await sql`
+        SELECT id FROM players
+        WHERE LOWER(email) = LOWER(${queryVal}) AND auth_provider = 'google'
+        LIMIT 1
+      `;
+      if (pRows.length > 0) {
+        res.json({ isGoogle: true, message: 'This account is registered with Google. Try signing in with Google.' });
+        return;
+      }
+    } else {
+      const rows = await sql`
+        SELECT email FROM google_accounts
+        WHERE LOWER(callsign) = LOWER(${queryVal})
+        LIMIT 1
+      `;
+      if (rows.length > 0) {
+        res.json({ isGoogle: true, message: 'This account is registered with Google. Try signing in with Google.' });
+        return;
+      }
+
+      const pRows = await sql`
+        SELECT id FROM players
+        WHERE LOWER(callsign) = LOWER(${queryVal}) AND auth_provider = 'google'
+        LIMIT 1
+      `;
+      if (pRows.length > 0) {
+        res.json({ isGoogle: true, message: 'This account is registered with Google. Try signing in with Google.' });
+        return;
+      }
+    }
+
+    res.json({ isGoogle: false });
+  } catch (err) {
+    console.error('Check google error:', err);
+    res.json({ isGoogle: false });
   }
 });
 
@@ -163,6 +238,35 @@ router.post('/send-verification-code', async (req: Request, res: Response) => {
 
     if (!/^[a-zA-Z0-9_-]+$/.test(cleanUsername)) {
       res.status(400).json({ error: 'Username can only contain letters, numbers, underscores, and dashes.' });
+      return;
+    }
+
+    // Check if account is registered with Google
+    const googleCheck = await sql`
+      SELECT email FROM google_accounts
+      WHERE LOWER(email) = LOWER(${trimmedEmail})
+         OR LOWER(callsign) = LOWER(${cleanUsername})
+      LIMIT 1
+    `;
+    if (googleCheck.length > 0) {
+      res.status(400).json({
+        error: 'This account is registered with Google. Try signing in with Google.',
+        isGoogle: true,
+      });
+      return;
+    }
+
+    const playerGoogleCheck = await sql`
+      SELECT id FROM players
+      WHERE (LOWER(email) = LOWER(${trimmedEmail}) OR LOWER(callsign) = LOWER(${cleanUsername}))
+        AND auth_provider = 'google'
+      LIMIT 1
+    `;
+    if (playerGoogleCheck.length > 0) {
+      res.status(400).json({
+        error: 'This account is registered with Google. Try signing in with Google.',
+        isGoogle: true,
+      });
       return;
     }
 
@@ -311,8 +415,21 @@ router.delete('/account', async (req: Request, res: Response) => {
       WHERE (firebase_uid IS NOT NULL AND firebase_uid = ${firebaseUid || ''})
          OR (guest_token IS NOT NULL AND guest_token = ${activeToken || ''})
          OR (callsign IS NOT NULL AND callsign = ${callsign || ''})
-      RETURNING id, callsign
+      RETURNING id, callsign, firebase_uid, email
     `;
+
+    // Also remove from google_accounts and verification_codes
+    if (firebaseUid || callsign) {
+      await sql`
+        DELETE FROM google_accounts
+        WHERE (firebase_uid IS NOT NULL AND firebase_uid = ${firebaseUid || ''})
+           OR (callsign IS NOT NULL AND callsign = ${callsign || ''})
+      `;
+      await sql`
+        DELETE FROM verification_codes
+        WHERE (username IS NOT NULL AND username = ${callsign || ''})
+      `;
+    }
 
     res.json({
       success: true,

@@ -9,6 +9,8 @@ interface LeaderboardModalProps {
   userHighScore: number;
   onClose: () => void;
   isOnline?: boolean;
+  isGuest?: boolean;
+  onOpenAuth?: () => void;
 }
 
 export const LeaderboardModal: React.FC<LeaderboardModalProps> = ({
@@ -17,6 +19,8 @@ export const LeaderboardModal: React.FC<LeaderboardModalProps> = ({
   userHighScore,
   onClose,
   isOnline = false,
+  isGuest = false,
+  onOpenAuth,
 }) => {
   const [activeTab, setActiveTab] = useState<'all' | 'today'>('all');
   const [entries, setEntries] = useState<LeaderboardEntry[]>(initialEntries);
@@ -220,16 +224,33 @@ export const LeaderboardModal: React.FC<LeaderboardModalProps> = ({
         </div>
 
         {/* Footer */}
-        <div className="pt-3 border-t-2 border-[#e2e8f0] text-center space-y-1">
-          <p className="font-sketch text-xs font-bold text-[#64748b]">
-            Your Record: <span className="text-[#1e293b] font-bold">{userCallsign}</span> · Best:{' '}
-            <span className="text-[#0284c7] font-title text-base font-bold tabular-nums">
-              {userHighScore}
-            </span>
-          </p>
+        <div className="pt-3 border-t-2 border-[#e2e8f0] text-center space-y-1.5">
+          {isGuest && onOpenAuth ? (
+            <div className="bg-[#fef3c7] border border-[#f59e0b] rounded-lg py-1.5 px-2 flex items-center justify-between gap-2">
+              <span className="font-sketch text-[11px] font-bold text-[#92400e] text-left">
+                Guest Mode · Sign in to save your score & rank on the official leaderboard!
+              </span>
+              <button
+                onClick={() => {
+                  onClose();
+                  onOpenAuth();
+                }}
+                className="shrink-0 text-xs font-sketch font-black text-[#1e293b] bg-[#fde047] hover:bg-[#facc15] px-2.5 py-1 rounded-md border border-[#2d2a26] shadow-[1px_1px_0px_#2d2a26] cursor-pointer"
+              >
+                Sign In
+              </button>
+            </div>
+          ) : (
+            <p className="font-sketch text-xs font-bold text-[#64748b]">
+              Your Record: <span className="text-[#1e293b] font-bold">{userCallsign}</span> · Best:{' '}
+              <span className="text-[#0284c7] font-title text-base font-bold tabular-nums">
+                {userHighScore}
+              </span>
+            </p>
+          )}
           <div className="flex items-center justify-center gap-1 text-[11px] font-sketch text-[#94a3b8]">
             <ShieldCheck size={12} className="text-emerald-500" />
-            <span>Anti-cheat verified · Synchronized across all pilots</span>
+            <span>Anti-cheat verified · Synchronized across all verified pilots</span>
           </div>
         </div>
       </div>

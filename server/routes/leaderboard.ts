@@ -10,9 +10,11 @@ router.get('/', optionalAuth, async (req: AuthenticatedRequest, res: Response) =
     const limit = Math.min(Math.max(parseInt(req.query.limit as string) || 100, 1), 500);
 
     const rows = await sql`
-      SELECT id, player_id, callsign, score, clips, skin, achieved_at
-      FROM leaderboard
-      ORDER BY score DESC, clips DESC, achieved_at ASC
+      SELECT l.id, l.player_id, l.callsign, l.score, l.clips, l.skin, l.achieved_at
+      FROM leaderboard l
+      JOIN players p ON l.player_id = p.id
+      WHERE p.firebase_uid IS NOT NULL
+      ORDER BY l.score DESC, l.clips DESC, l.achieved_at ASC
       LIMIT ${limit}
     `;
 
@@ -40,10 +42,12 @@ router.get('/daily', optionalAuth, async (req: AuthenticatedRequest, res: Respon
     const limit = Math.min(Math.max(parseInt(req.query.limit as string) || 100, 1), 500);
 
     const rows = await sql`
-      SELECT id, player_id, callsign, score, clips, skin, achieved_at
-      FROM leaderboard
-      WHERE achieved_at >= CURRENT_DATE
-      ORDER BY score DESC, clips DESC, achieved_at ASC
+      SELECT l.id, l.player_id, l.callsign, l.score, l.clips, l.skin, l.achieved_at
+      FROM leaderboard l
+      JOIN players p ON l.player_id = p.id
+      WHERE p.firebase_uid IS NOT NULL
+        AND l.achieved_at >= CURRENT_DATE
+      ORDER BY l.score DESC, l.clips DESC, l.achieved_at ASC
       LIMIT ${limit}
     `;
 

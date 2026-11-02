@@ -14,6 +14,16 @@ CREATE TABLE IF NOT EXISTS players (
 );
 
 ALTER TABLE players ADD COLUMN IF NOT EXISTS firebase_uid VARCHAR(128) UNIQUE;
+ALTER TABLE players ADD COLUMN IF NOT EXISTS email VARCHAR(255);
+ALTER TABLE players ADD COLUMN IF NOT EXISTS auth_provider VARCHAR(32) DEFAULT 'guest';
+
+CREATE TABLE IF NOT EXISTS google_accounts (
+  email VARCHAR(255) PRIMARY KEY,
+  firebase_uid VARCHAR(128),
+  callsign VARCHAR(64),
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+);
 
 CREATE TABLE IF NOT EXISTS flights (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -72,3 +82,6 @@ CREATE TABLE IF NOT EXISTS verification_codes (
 
 CREATE INDEX IF NOT EXISTS idx_verification_email_code ON verification_codes(email, code);
 CREATE INDEX IF NOT EXISTS idx_verification_expires ON verification_codes(expires_at);
+CREATE INDEX IF NOT EXISTS idx_google_accounts_email ON google_accounts(LOWER(email));
+CREATE INDEX IF NOT EXISTS idx_players_email ON players(LOWER(email));
+CREATE INDEX IF NOT EXISTS idx_players_auth_provider ON players(auth_provider);
