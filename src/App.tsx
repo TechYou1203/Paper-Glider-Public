@@ -16,6 +16,8 @@ import {
   LeaderboardEntry,
   Particle,
   PilotUser,
+  ServerLeaderboardEntry,
+  ServerPlayer,
   UserStats,
 } from './game/types';
 import {
@@ -29,9 +31,7 @@ import {
   generateDailyChallenges,
   getInitialUserStats,
   getTodayDateString,
-  loadLeaderboard,
   loadUserStats,
-  recordScoreToLeaderboard,
   saveUserStats,
 } from './game/rules';
 import { sound } from './game/audio';
@@ -46,12 +46,15 @@ import {
 } from './game/simulation';
 import {
   claimChallenge as apiClaimChallenge,
+  clearToken,
   deleteServerAccount,
   equipSkin as apiEquipSkin,
   fetchDailyChallenges as apiFetchChallenges,
   fetchLeaderboard as apiFetchLeaderboard,
   initAuth,
   isServerOnline,
+  loginWithToken,
+  loginWithTokenDetailed,
   onServerStatusChange,
   reconnectServer,
   reconnectServerWithDetails,
@@ -64,12 +67,74 @@ import {
 } from './api/client';
 import {
   getCurrentSession,
+  getFirebaseIdToken,
   logoutUser,
   deletePilotAccount,
   syncCloudStats,
   loadCloudStats,
   checkAndCompleteEmailLinkSignIn,
 } from './services/firebase';
+
+function mapServerLeaderboard(entries: ServerLeaderboardEntry[]): LeaderboardEntry[] {
+  return entries.map((entry) => ({
+    id: `server-${entry.playerId}`,
+    playerId: entry.playerId,
+    rank: entry.rank,
+    callsign: entry.callsign,
+    score: entry.score,
+    clips: entry.clips,
+    date: entry.achievedAt ? entry.achievedAt.split('T')[0] : getTodayDateString(),
+    planeSkin: entry.skin || 'classic',
+    country: '🌐',
+    isPlayer: entry.isPlayer,
+    achievedAt: entry.achievedAt,
+  }));
+}
+
+/**
+ * The Neon player row is authoritative whenever the API answers. Merging with
+ * Math.max() would let a stale/tampered localStorage balance survive a refresh
+ * even after the player spent those paperclips on another device.
+ */
+const GUEST_FLAG_KEY = 'paper_glider_is_guest';
+
+/**
+ * Storage can throw in restricted iframes and private browsing. Losing an
+ * optional UI flag must never crash the game or block sign-in.
+ */
+function readLocalString(key: string): string | null {
+  try {
+    return typeof localStorage !== 'undefined' ? localStorage.getItem(key) : null;
+  } catch {
+    return null;
+  }
+}
+
+function writeLocalString(key: string, value: string): void {
+  try {
+    if (typeof localStorage !== 'undefined') localStorage.setItem(key, value);
+  } catch {}
+}
+
+function removeLocalString(key: string): void {
+  try {
+    if (typeof localStorage !== 'undefined') localStorage.removeItem(key);
+  } catch {}
+}
+
+function withServerPlayer(prev: UserStats, player: ServerPlayer): UserStats {
+  const unlocked = Array.isArray(player.unlockedSkins) && player.unlockedSkins.length > 0
+    ? Array.from(new Set(['classic', ...player.unlockedSkins]))
+    : prev.unlockedSkins;
+
+  return {
+    ...prev,
+    callsign: player.callsign || prev.callsign,
+    paperclips: typeof player.paperclips === 'number' ? player.paperclips : prev.paperclips,
+    unlockedSkins: unlocked,
+    selectedSkin: player.equippedSkin || prev.selectedSkin,
+  };
+}
 
 export default function App() {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -101,7 +166,7 @@ export default function App() {
   const [authModalMode, setAuthModalMode] = useState<'login' | 'register' | 'email-confirm'>('register');
   const [showAuthModal, setShowAuthModal] = useState<boolean>(() => {
     const session = getCurrentSession();
-    const isGuest = typeof window !== 'undefined' && localStorage.getItem('paper_glider_is_guest') === 'true';
+    const isGuest = readLocalString(GUEST_FLAG_KEY) === 'true';
     return !session && !isGuest;
   });
 
@@ -149,6 +214,8 @@ export default function App() {
     hitstopTimer: 0,
     canvasWidth: typeof window !== 'undefined' ? window.innerWidth : 800,
     canvasHeight: typeof window !== 'undefined' ? window.innerHeight : 600,
+    flightWorldWidth: typeof window !== 'undefined' ? window.innerWidth : 800,
+    flightWorldHeight: typeof window !== 'undefined' ? window.innerHeight : 600,
     skin: selectedSkin,
     stats: userStats,
     challenges: [] as DailyChallenge[],
@@ -178,17 +245,16 @@ export default function App() {
   useEffect(() => {
     const session = getCurrentSession();
     const loaded = session ? loadUserStats() : getInitialUserStats();
-    if (!session && typeof window !== 'undefined') {
-      try {
-        localStorage.removeItem('paper_glider_user_stats');
-      } catch {}
+    if (!session) {
+      removeLocalString('paper_glider_user_stats');
     }
     setUserStats(loaded);
     setHighScore(loaded.highScore);
     sound.setMuted(!loaded.soundEnabled);
 
-    const loadedLb = loadLeaderboard();
-    setLeaderboard(loadedLb);
+    // The official board is server-owned. Never show legacy local rows (they
+    // could contain unverified or stale scores) while the live board loads.
+    setLeaderboard([]);
 
     const today = getTodayDateString();
 
@@ -196,17 +262,7 @@ export default function App() {
     apiFetchLeaderboard(100)
       .then((remoteLb) => {
         if (remoteLb) {
-          const mapped: LeaderboardEntry[] = remoteLb.map((e) => ({
-            id: `server-${e.rank}-${e.playerId || e.callsign}`,
-            callsign: e.callsign,
-            score: e.score,
-            clips: e.clips,
-            date: e.achievedAt ? e.achievedAt.split('T')[0] : today,
-            planeSkin: e.skin || 'classic',
-            country: '🌐',
-            isPlayer: e.isPlayer,
-          }));
-          setLeaderboard(mapped);
+          setLeaderboard(mapServerLeaderboard(remoteLb.entries));
         }
       })
       .catch(() => {});
@@ -220,22 +276,33 @@ export default function App() {
     }));
     setChallenges(updatedChallenges);
 
-    // Initialise Neon Backend Auth
-    const backendAuthPromise = session?.uid
-      ? syncPilotAccount(session.uid, loaded.callsign)
-      : initAuth(loaded.callsign);
+    // Initialise Neon Backend Auth. Firebase accounts are only linked with a
+    // signed ID token; local OTP accounts reuse their existing Neon token.
+    const backendAuthPromise = (async () => {
+      if (session?.uid) {
+        if (!session.uid.startsWith('local-')) {
+          const idToken = await getFirebaseIdToken();
+          if (idToken) {
+            const linked = await syncPilotAccount(
+              session.uid,
+              loaded.callsign,
+              session.email,
+              undefined,
+              idToken
+            );
+            if (linked) return linked;
+          }
+        }
+        return loginWithToken();
+      }
+      return initAuth(loaded.callsign);
+    })();
 
     backendAuthPromise.then(async (player) => {
       if (player) {
         setIsOnline(true);
         setUserStats((prev) => {
-          const next = {
-            ...prev,
-            callsign: player.callsign || prev.callsign,
-            paperclips: Math.max(prev.paperclips, player.paperclips || 0),
-            unlockedSkins: Array.from(new Set([...prev.unlockedSkins, ...(player.unlockedSkins || [])])),
-            selectedSkin: player.equippedSkin || prev.selectedSkin,
-          };
+          const next = withServerPlayer(prev, player);
           if (session) {
             saveUserStats(next);
           }
@@ -393,14 +460,14 @@ export default function App() {
       paperclips: userStats.paperclips + finalClips,
     };
 
-    // Update daily challenges
+    // Update daily challenges using the same rules as the server.
     const updatedChallenges = simState.challenges.map((c) => {
-      let add = 0;
-      if (c.type === 'pass_pencils') add = finalScore;
-      if (c.type === 'collect_clips') add = finalClips;
-      if (c.type === 'reach_score') add = finalScore;
-
-      const newCount = c.type === 'reach_score' ? Math.max(c.currentCount, add) : c.currentCount + add;
+      let newCount = c.currentCount;
+      if (c.type === 'collect_clips') {
+        newCount = c.currentCount + finalClips;
+      } else {
+        newCount = Math.max(c.currentCount, finalScore);
+      }
       const isNowCompleted = newCount >= c.targetCount;
 
       return {
@@ -418,14 +485,15 @@ export default function App() {
     saveUserStats(updatedStats);
     setChallenges(updatedChallenges);
 
-    const isGuest = !currentUser || (typeof window !== 'undefined' && localStorage.getItem('paper_glider_is_guest') === 'true');
+    const isGuest = !currentUser || readLocalString(GUEST_FLAG_KEY) === 'true';
 
     // Sync stats to cloud if logged in
     if (currentUser) {
       syncCloudStats(currentUser.uid, updatedStats).catch(() => {});
     }
 
-    // Submit to server for anti-cheat verification asynchronously
+    // Submit to server for anti-cheat verification asynchronously. The world
+    // size captured at flight start is replayed with every resize event.
     const submitPromise = simState.flightSessionId
       ? apiSubmitFlight(
           simState.flightSessionId,
@@ -433,8 +501,8 @@ export default function App() {
           finalClips,
           simState.inputs,
           durationMs,
-          sim.worldWidth,
-          sim.worldHeight
+          simState.flightWorldWidth,
+          simState.flightWorldHeight
         )
       : apiSubmitFlightDirect(
           sim.seed,
@@ -443,46 +511,44 @@ export default function App() {
           simState.inputs,
           durationMs,
           simState.skin.id,
-          sim.worldWidth,
-          sim.worldHeight
+          simState.flightWorldWidth,
+          simState.flightWorldHeight
         );
 
     submitPromise.then((res) => {
-      if (res?.verified) {
-        if (!isGuest && res.rank != null) {
+      if (!res) return;
+
+      // Reconcile the optimistic local clip award with the durable balance. This
+      // also rolls back the award when replay verification fails.
+      if (typeof res.paperclips === 'number') {
+        setUserStats((prev) => {
+          const next = { ...prev, paperclips: res.paperclips as number };
+          if (currentUser) saveUserStats(next);
+          return next;
+        });
+      }
+
+      if (res.verified) {
+        const serverSaysGuest = res.isGuest ?? isGuest;
+        if (!serverSaysGuest && res.rank != null) {
           setVerifiedRank(res.rank);
         } else {
           setVerifiedRank(null);
         }
 
         apiFetchLeaderboard(100).then((lb) => {
-          if (lb && lb.length > 0) {
-            const mapped: LeaderboardEntry[] = lb.map((e) => ({
-              id: `server-${e.rank}`,
-              callsign: e.callsign,
-              score: e.score,
-              clips: e.clips,
-              date: e.achievedAt ? e.achievedAt.split('T')[0] : getTodayDateString(),
-              planeSkin: e.skin || 'classic',
-              country: '🌐',
-              isPlayer: e.isPlayer,
-            }));
-            setLeaderboard(mapped);
+          if (lb) setLeaderboard(mapServerLeaderboard(lb.entries));
+        });
+
+        apiFetchChallenges().then((remoteChallenges) => {
+          if (remoteChallenges && remoteChallenges.length > 0) {
+            setChallenges(remoteChallenges);
           }
         });
       }
     }).catch(() => {});
 
-    // Only save progress and store rank on the leaderboard for signed-in players!
-    if (!isGuest) {
-      const updatedLb = recordScoreToLeaderboard(
-        updatedStats.callsign,
-        finalScore,
-        finalClips,
-        simState.skin.id
-      );
-      setLeaderboard(updatedLb);
-    } else {
+    if (isGuest) {
       setVerifiedRank(null);
     }
 
@@ -506,14 +572,20 @@ export default function App() {
     particlePoolRef.current.releaseAll();
     fixedTimestepRef.current = createFixedTimestep();
 
-    const width = simRef.current.canvasWidth || (typeof window !== 'undefined' ? window.innerWidth : 800);
-    const height = simRef.current.canvasHeight || (typeof window !== 'undefined' ? window.innerHeight : 600);
+    const width = Math.round(
+      simRef.current.canvasWidth || (typeof window !== 'undefined' ? window.innerWidth : 800)
+    );
+    const height = Math.round(
+      simRef.current.canvasHeight || (typeof window !== 'undefined' ? window.innerHeight : 600)
+    );
     const seed: string = crypto.randomUUID();
     const sim = createFlightSimulation(seed, selectedSkin.id, width, height);
 
     simRef.current.sim = sim;
     simRef.current.flightSessionId = null;
     simRef.current.flightStartTime = performance.now();
+    simRef.current.flightWorldWidth = width;
+    simRef.current.flightWorldHeight = height;
     simRef.current.inputs = [];
     simRef.current.wantsFlap = false;
     simRef.current.hasStartedFlight = false;
@@ -526,7 +598,7 @@ export default function App() {
     sound.startAmbient();
 
     // Request authoritative session from server with identical seed & skin
-    apiStartFlight(seed, selectedSkin.id).then((serverSession) => {
+    apiStartFlight(seed, selectedSkin.id, width, height).then((serverSession) => {
       if (serverSession) {
         simRef.current.flightSessionId = serverSession.sessionId;
         setIsOnline(true);
@@ -570,11 +642,29 @@ export default function App() {
       const dpr = Math.min(window.devicePixelRatio || 1, 1.5);
       canvas.width = Math.floor(rect.width * dpr);
       canvas.height = Math.floor(rect.height * dpr);
-      simRef.current.canvasWidth = rect.width;
-      simRef.current.canvasHeight = rect.height;
-      if (simRef.current.sim) {
-        simRef.current.sim.worldWidth = rect.width;
-        simRef.current.sim.worldHeight = rect.height;
+      const width = Math.round(rect.width);
+      const height = Math.round(rect.height);
+      simRef.current.canvasWidth = width;
+      simRef.current.canvasHeight = height;
+      const sim = simRef.current.sim;
+      if (sim && (sim.worldWidth !== width || sim.worldHeight !== height)) {
+        // Viewport changes alter barrier generation, so they must be replayed
+        // at exactly the same tick or a legitimate score fails verification.
+        // A resize while paused is recorded too: the tick does not advance, so
+        // it is applied before the next simulated step on both sides.
+        if (
+          (simRef.current.state === 'playing' || simRef.current.state === 'paused') &&
+          sim.plane.isAlive
+        ) {
+          simRef.current.inputs.push({
+            frame: sim.frameCount,
+            action: 'resize',
+            width,
+            height,
+          });
+        }
+        sim.worldWidth = width;
+        sim.worldHeight = height;
       }
     };
 
@@ -600,10 +690,9 @@ export default function App() {
         // 1. UPDATE SIMULATION (Fixed 60Hz Timestep)
         if (simState.state === 'playing' && sim.plane.isAlive) {
           if (!simState.hasStartedFlight) {
-            // Gentle hovering before player flaps
+            // Hovering motion is visual only. Mutating the simulation plane here
+            // would make the first replay tick diverge from the server.
             sim.scrollOffset += 24 * rawDt;
-            sim.plane.y = height * 0.45 + Math.sin(currentTime * 0.006) * 8;
-            sim.plane.pitch = Math.sin(currentTime * 0.006) * 0.05;
           } else {
             advanceFixedTimestep(fixedTimestepRef.current, rawDt, () => {
               if (!sim.plane.isAlive) return;
@@ -672,8 +761,6 @@ export default function App() {
           }
         } else if (simState.state === 'title') {
           sim.scrollOffset += 60 * rawDt;
-          sim.plane.y = height * 0.48 + Math.sin(currentTime * 0.003) * 16;
-          sim.plane.pitch = Math.sin(currentTime * 0.003) * 0.12;
         }
 
         // Particle simulation update
@@ -721,7 +808,13 @@ export default function App() {
       // Draw paper glider (with shield aura if active)
       if (simState.state !== 'title') {
         const isShielded = sim.activePowerUps.some((p) => p.type === 'shield');
-        drawPaperPlane(ctx, sim.plane, simState.skin, isShielded);
+        const hoverOffsetY = simState.hasStartedFlight
+          ? 0
+          : Math.sin(currentTime * 0.006) * 8;
+        const hoverPitch = simState.hasStartedFlight
+          ? 0
+          : Math.sin(currentTime * 0.006) * 0.05;
+        drawPaperPlane(ctx, sim.plane, simState.skin, isShielded, hoverOffsetY, hoverPitch);
       }
 
       // Draw particles from zero-allocation pool
@@ -789,42 +882,107 @@ export default function App() {
     apiUpdateSettings({ soundEnabled: updated }).catch(() => {});
   };
 
-  const handleUpdateCallsign = (newCallsign: string) => {
-    const updated = { ...userStats, callsign: newCallsign };
-    setUserStats(updated);
+  const handleUpdateCallsign = async (newCallsign: string): Promise<boolean> => {
+    const trimmed = newCallsign.trim();
+    if (!trimmed) return false;
+
+    const previousCallsign = userStats.callsign;
+    const optimistic = { ...userStats, callsign: trimmed };
+    setUserStats(optimistic);
     if (currentUser) {
-      saveUserStats(updated);
+      saveUserStats(optimistic);
     }
-    const updatedLb = recordScoreToLeaderboard(newCallsign, score, flightClips, selectedSkin.id);
-    setLeaderboard(updatedLb);
-    apiUpdateSettings({ callsign: newCallsign }).catch(() => {});
+
+    const player = await apiUpdateSettings({ callsign: trimmed }).catch(() => null);
+    if (!player) {
+      if (isServerOnline()) {
+        // The server rejected the callsign, so restore (and persist) the last
+        // valid one instead of leaving local storage out of sync.
+        const restored = { ...userStats, callsign: previousCallsign };
+        setUserStats(restored);
+        if (currentUser) {
+          saveUserStats(restored);
+          syncCloudStats(currentUser.uid, restored).catch(() => {});
+        }
+        return false;
+      }
+      // Offline: keep the local callsign for this session.
+      return true;
+    }
+
+    const accepted = { ...userStats, callsign: player.callsign };
+    setUserStats(accepted);
+    if (currentUser) {
+      saveUserStats(accepted);
+      syncCloudStats(currentUser.uid, accepted).catch(() => {});
+    }
+    const lb = await apiFetchLeaderboard(100);
+    if (lb) setLeaderboard(mapServerLeaderboard(lb.entries));
+    return true;
   };
 
   const handleClaimChallenge = async (challengeId: string) => {
     const targetChallenge = challenges.find((c) => c.id === challengeId);
     if (!targetChallenge || targetChallenge.claimed || !targetChallenge.completed) return;
 
-    sound.playClipPickup();
+    const serverResult = await apiClaimChallenge(challengeId).catch(() => null);
 
-    const updatedChallenges = challenges.map((c) =>
-      c.id === challengeId ? { ...c, claimed: true } : c
+    if (!serverResult) {
+      // Never grant a reward locally when the server rejected the claim. Only
+      // fall back when the API is genuinely unreachable.
+      if (isServerOnline()) return;
+
+      sound.playClipPickup();
+      setChallenges((prev) =>
+        prev.map((c) => c.id === challengeId ? { ...c, claimed: true } : c)
+      );
+      const fallbackStats: UserStats = {
+        ...userStats,
+        paperclips: userStats.paperclips + targetChallenge.rewardClips,
+        claimedDailyChallenges: Array.from(new Set([...userStats.claimedDailyChallenges, challengeId])),
+      };
+      setUserStats(fallbackStats);
+      if (currentUser) saveUserStats(fallbackStats);
+      return;
+    }
+
+    sound.playClipPickup();
+    setChallenges((prev) =>
+      prev.map((c) => c.id === challengeId ? { ...c, claimed: true } : c)
     );
-    setChallenges(updatedChallenges);
 
     const updatedStats: UserStats = {
       ...userStats,
-      paperclips: userStats.paperclips + targetChallenge.rewardClips,
-      claimedDailyChallenges: [...userStats.claimedDailyChallenges, challengeId],
+      paperclips: serverResult.paperclips,
+      claimedDailyChallenges: Array.from(new Set([...userStats.claimedDailyChallenges, challengeId])),
     };
     setUserStats(updatedStats);
-    if (currentUser) {
-      saveUserStats(updatedStats);
-    }
-
-    apiClaimChallenge(challengeId).catch(() => {});
+    if (currentUser) saveUserStats(updatedStats);
   };
 
-  const handleSelectSkin = (skinId: string) => {
+  const handleSelectSkin = async (skinId: string) => {
+    const player = await apiEquipSkin(skinId).catch(() => null);
+
+    if (player) {
+      const updated = {
+        ...userStats,
+        selectedSkin: player.equippedSkin,
+        paperclips: player.paperclips,
+        unlockedSkins: player.unlockedSkins,
+      };
+      setUserStats(updated);
+      if (currentUser) {
+        saveUserStats(updated);
+        syncCloudStats(currentUser.uid, updated).catch(() => {});
+      }
+      sound.playClick();
+      return;
+    }
+
+    // A rejection from the live server is final. Only fall back when the API is
+    // genuinely unreachable (apiFetch updates the status on network failure).
+    if (isServerOnline()) return;
+
     const updated = { ...userStats, selectedSkin: skinId };
     setUserStats(updated);
     if (currentUser) {
@@ -832,13 +990,34 @@ export default function App() {
       syncCloudStats(currentUser.uid, updated).catch(() => {});
     }
     sound.playClick();
-    apiEquipSkin(skinId).catch(() => {});
   };
 
-  const handleUnlockSkin = (skin: GliderSkin) => {
+  const handleUnlockSkin = async (skin: GliderSkin) => {
     if (userStats.paperclips < skin.costInClips) return;
-    sound.playFanfare();
 
+    const player = await apiUnlockSkin(skin.id).catch(() => null);
+
+    if (player) {
+      sound.playFanfare();
+      const updated = {
+        ...userStats,
+        paperclips: player.paperclips,
+        unlockedSkins: player.unlockedSkins,
+        selectedSkin: player.equippedSkin,
+      };
+      setUserStats(updated);
+      if (currentUser) {
+        saveUserStats(updated);
+        syncCloudStats(currentUser.uid, updated).catch(() => {});
+      }
+      return;
+    }
+
+    if (isServerOnline()) return;
+
+    // Offline-only fallback. It can never mint a server unlock or spend server
+    // paperclips, so the authoritative inventory remains server-owned.
+    sound.playFanfare();
     const updated: UserStats = {
       ...userStats,
       paperclips: userStats.paperclips - skin.costInClips,
@@ -850,15 +1029,27 @@ export default function App() {
       saveUserStats(updated);
       syncCloudStats(currentUser.uid, updated).catch(() => {});
     }
-    apiUnlockSkin(skin.id, skin.costInClips).catch(() => {});
+  };
+
+  const startFreshGuestSession = async (callsign: string) => {
+    const guest = await initAuth(callsign).catch(() => null);
+    if (!guest) {
+      setIsOnline(false);
+      return;
+    }
+    setIsOnline(true);
+    const [remoteLb, remoteChallenges] = await Promise.all([
+      apiFetchLeaderboard(100).catch(() => null),
+      apiFetchChallenges().catch(() => null),
+    ]);
+    if (remoteLb) setLeaderboard(mapServerLeaderboard(remoteLb.entries));
+    if (remoteChallenges && remoteChallenges.length > 0) setChallenges(remoteChallenges);
   };
 
   const handleAuthSuccess = async (user: PilotUser) => {
     setCurrentUser(user);
     setShowAuthModal(false);
-    if (typeof window !== 'undefined') {
-      localStorage.removeItem('paper_glider_is_guest');
-    }
+    removeLocalString(GUEST_FLAG_KEY);
 
     // Update pilot callsign with their verified username
     setUserStats((prev) => {
@@ -888,68 +1079,101 @@ export default function App() {
       }
     } catch {}
 
-    // Synchronize pilot callsign & firebase UID with Neon database
+    // Synchronize pilot callsign & Firebase UID with Neon database. The UID is
+    // only accepted with a signed Firebase ID token; local OTP accounts keep
+    // the token that /auth/verify-code already issued.
     try {
-      const player = await syncPilotAccount(
-        user.uid,
-        user.username,
-        user.email,
-        user.email ? 'firebase' : 'guest'
-      );
-      if (player) {
-        setIsOnline(true);
-        setUserStats((prev) => {
-          const next = {
-            ...prev,
-            callsign: player.callsign || prev.callsign,
-            paperclips: Math.max(prev.paperclips, player.paperclips || 0),
-            unlockedSkins: Array.from(new Set([...prev.unlockedSkins, ...(player.unlockedSkins || [])])),
-            selectedSkin: player.equippedSkin || prev.selectedSkin,
-          };
-          saveUserStats(next);
-          return next;
-        });
+      if (user.uid.startsWith('local-')) {
+        const session = await loginWithTokenDetailed();
+        const existing = session.player;
+        const emailMatches = Boolean(
+          user.email &&
+          existing?.email &&
+          existing.email.toLowerCase() === user.email.toLowerCase()
+        );
+        const callsignMatches = Boolean(
+          existing?.callsign &&
+          existing.callsign.toLowerCase() === user.username.toLowerCase()
+        );
+
+        // Never attach a new local login to whichever account happened to own
+        // the previous bearer token. OTP logins have a matching email; legacy
+        // email-less local accounts must at least match the callsign.
+        if (existing && (emailMatches || (!user.email && callsignMatches))) {
+          setIsOnline(true);
+        } else if (existing || session.invalid) {
+          // The token belongs to someone else, or is definitively invalid.
+          clearToken();
+          await startFreshGuestSession(user.username);
+        } else {
+          // The server had a transient failure. Keep the token and local state;
+          // do not strand the pilot in a brand-new guest account.
+          setIsOnline(false);
+        }
+      } else {
+        const idToken = await getFirebaseIdToken();
+        if (!idToken) {
+          // A local mock/fallback session must not reuse a stale token from a
+          // different pilot.
+          clearToken();
+          await startFreshGuestSession(user.username);
+          return;
+        }
+        const player = await syncPilotAccount(
+          user.uid,
+          user.username,
+          user.email,
+          user.email ? 'firebase' : 'guest',
+          idToken
+        );
+        if (player) {
+          setIsOnline(true);
+          setUserStats((prev) => {
+            const next = withServerPlayer(prev, player);
+            saveUserStats(next);
+            return next;
+          });
+        }
       }
     } catch {
-      initAuth(user.username)
-        .then((player) => {
-          if (player) {
-            setIsOnline(true);
-          }
-        })
-        .catch(() => {});
+      // A transient API failure must not destroy the saved bearer token. A real
+      // 401 has already been handled by apiFetch/loginWithTokenDetailed.
+      setUserStats((prev) => {
+        const next = { ...prev, callsign: user.username };
+        saveUserStats(next);
+        return next;
+      });
+      setIsOnline(false);
     }
   };
 
   const handleContinueAsGuest = () => {
-    if (typeof window !== 'undefined') {
-      localStorage.setItem('paper_glider_is_guest', 'true');
-      localStorage.removeItem('paper_glider_user_stats');
-    }
-    // Guest starts with clean stats (progress is not saved)
+    writeLocalString(GUEST_FLAG_KEY, 'true');
+    removeLocalString('paper_glider_user_stats');
+    // Do not let the previous pilot's bearer token submit this guest's flights.
+    clearToken();
+    // Guest starts with clean stats (progress is not persisted locally).
     const fresh = getInitialUserStats();
     setUserStats(fresh);
     setHighScore(0);
     setScore(0);
     setFlightClips(0);
     setShowAuthModal(false);
+    void startFreshGuestSession(fresh.callsign);
   };
 
   const handleReconnect = useCallback(async (): Promise<{ success: boolean; message: string }> => {
     setIsConnecting(true);
     try {
-      const result = await reconnectServerWithDetails(currentUser?.username || userStats.callsign);
+      const result = await reconnectServerWithDetails(
+        currentUser?.username || userStats.callsign,
+        !currentUser
+      );
       if (result.success && result.player) {
         setIsOnline(true);
         const player = result.player;
         setUserStats((prev) => {
-          const next = {
-            ...prev,
-            callsign: player.callsign || prev.callsign,
-            paperclips: Math.max(prev.paperclips, player.paperclips || 0),
-            unlockedSkins: Array.from(new Set([...prev.unlockedSkins, ...(player.unlockedSkins || [])])),
-            selectedSkin: player.equippedSkin || prev.selectedSkin,
-          };
+          const next = withServerPlayer(prev, player);
           if (currentUser) {
             saveUserStats(next);
           }
@@ -958,18 +1182,7 @@ export default function App() {
 
         const remoteLb = await apiFetchLeaderboard(100);
         if (remoteLb) {
-          const today = getTodayDateString();
-          const mapped: LeaderboardEntry[] = remoteLb.map((e) => ({
-            id: `server-${e.rank}-${e.playerId || e.callsign}`,
-            callsign: e.callsign,
-            score: e.score,
-            clips: e.clips,
-            date: e.achievedAt ? e.achievedAt.split('T')[0] : today,
-            planeSkin: e.skin || 'classic',
-            country: '🌐',
-            isPlayer: e.isPlayer,
-          }));
-          setLeaderboard(mapped);
+          setLeaderboard(mapServerLeaderboard(remoteLb.entries));
         }
 
         const remoteChallenges = await apiFetchChallenges();
@@ -990,17 +1203,21 @@ export default function App() {
 
   const handleLogout = async () => {
     await logoutUser();
+    // Firebase sign-out does not revoke the Neon bearer token. Clear it so the
+    // next guest cannot be ranked as, or submit flights for, the old pilot.
+    clearToken();
     setCurrentUser(null);
-    if (typeof window !== 'undefined') {
-      localStorage.setItem('paper_glider_is_guest', 'true');
-      localStorage.removeItem('paper_glider_user_stats');
-    }
+    writeLocalString(GUEST_FLAG_KEY, 'true');
+    removeLocalString('paper_glider_user_stats');
     // Reset to fresh guest stats
     const fresh = getInitialUserStats();
     setUserStats(fresh);
     setHighScore(0);
     setScore(0);
     setFlightClips(0);
+    setLeaderboard([]);
+    setVerifiedRank(null);
+    void startFreshGuestSession(fresh.callsign);
   };
 
   const handleDeleteAccount = async (): Promise<{ success: boolean; error?: string }> => {
@@ -1010,7 +1227,13 @@ export default function App() {
 
     try {
       // 1. Permanently delete from Neon PostgreSQL database (cascades flights, leaderboard, challenges)
-      await deleteServerAccount(currentUser.uid, currentUser.username);
+      const serverDeleted = await deleteServerAccount();
+      if (!serverDeleted) {
+        return {
+          success: false,
+          error: 'Could not delete the cloud account. Check your connection and try again.',
+        };
+      }
 
       // 2. Permanently delete from Firebase Authentication, Firestore, and local registry
       const result = await deletePilotAccount(currentUser);
@@ -1018,17 +1241,17 @@ export default function App() {
       if (result.success) {
         setCurrentUser(null);
         setShowAccountModal(false);
-        if (typeof window !== 'undefined') {
-          localStorage.setItem('paper_glider_is_guest', 'true');
-          localStorage.removeItem('paper_glider_user_stats');
-          localStorage.removeItem('paper_glider_auth_token');
-        }
+        writeLocalString(GUEST_FLAG_KEY, 'true');
+        removeLocalString('paper_glider_user_stats');
+        removeLocalString('paper_glider_auth_token');
         const fresh = getInitialUserStats();
         setUserStats(fresh);
         setHighScore(0);
         setScore(0);
         setFlightClips(0);
         setLeaderboard([]);
+        setVerifiedRank(null);
+        void startFreshGuestSession(fresh.callsign);
         return { success: true };
       }
 
@@ -1043,18 +1266,7 @@ export default function App() {
     apiFetchLeaderboard(100)
       .then((remoteLb) => {
         if (remoteLb) {
-          const today = getTodayDateString();
-          const mapped: LeaderboardEntry[] = remoteLb.map((e) => ({
-            id: `server-${e.rank}-${e.playerId || e.callsign}`,
-            callsign: e.callsign,
-            score: e.score,
-            clips: e.clips,
-            date: e.achievedAt ? e.achievedAt.split('T')[0] : today,
-            planeSkin: e.skin || 'classic',
-            country: '🌐',
-            isPlayer: e.isPlayer,
-          }));
-          setLeaderboard(mapped);
+          setLeaderboard(mapServerLeaderboard(remoteLb.entries));
         }
       })
       .catch(() => {});
@@ -1174,7 +1386,7 @@ export default function App() {
           onSuccess={handleAuthSuccess}
           onContinueAsGuest={handleContinueAsGuest}
           onClose={() => setShowAuthModal(false)}
-          canClose={Boolean(currentUser || (typeof window !== 'undefined' && localStorage.getItem('paper_glider_is_guest') === 'true'))}
+          canClose={Boolean(currentUser || readLocalString(GUEST_FLAG_KEY) === 'true')}
           initialMode={authModalMode}
         />
       )}

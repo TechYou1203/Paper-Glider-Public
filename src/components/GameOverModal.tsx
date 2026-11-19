@@ -11,7 +11,7 @@ interface GameOverModalProps {
   onHome: () => void;
   onOpenLeaderboard: () => void;
   onOpenChallenges: () => void;
-  onUpdateCallsign: (newCallsign: string) => void;
+  onUpdateCallsign: (newCallsign: string) => Promise<boolean>;
   verifiedRank?: number | null;
   isOnline?: boolean;
   isGuest?: boolean;
@@ -35,15 +35,17 @@ export const GameOverModal: React.FC<GameOverModalProps> = ({
   onOpenAuth,
 }) => {
   const [editingCallsign, setEditingCallsign] = useState(callsign);
-  const [savedSuccess, setSavedSuccess] = useState(false);
+  const [saveState, setSaveState] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
 
-  const handleSaveCallsign = (e: React.FormEvent) => {
+  const handleSaveCallsign = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (editingCallsign.trim()) {
-      onUpdateCallsign(editingCallsign.trim());
-      setSavedSuccess(true);
-      setTimeout(() => setSavedSuccess(false), 2000);
-    }
+    const trimmed = editingCallsign.trim();
+    if (!trimmed || saveState === 'saving') return;
+
+    setSaveState('saving');
+    const saved = await onUpdateCallsign(trimmed);
+    setSaveState(saved ? 'saved' : 'error');
+    setTimeout(() => setSaveState('idle'), 2000);
   };
 
   return (
@@ -110,7 +112,7 @@ export const GameOverModal: React.FC<GameOverModalProps> = ({
             <input
               id="callsign-input"
               type="text"
-              maxLength={14}
+              maxLength={20}
               value={editingCallsign}
               onChange={(e) => setEditingCallsign(e.target.value)}
               placeholder="Enter Callsign"
@@ -118,11 +120,17 @@ export const GameOverModal: React.FC<GameOverModalProps> = ({
             />
             <button
               type="submit"
-              className="px-3 py-1.5 bg-[#fde047] hover:bg-[#facc15] border-2 border-[#2d2a26] rounded-lg font-sketch text-sm font-bold text-[#1e293b] shadow-[2px_2px_0px_#2d2a26] active:translate-x-0.5 active:translate-y-0.5 cursor-pointer flex items-center gap-1"
+              disabled={saveState === 'saving'}
+              className="px-3 py-1.5 bg-[#fde047] hover:bg-[#facc15] border-2 border-[#2d2a26] rounded-lg font-sketch text-sm font-bold text-[#1e293b] shadow-[2px_2px_0px_#2d2a26] active:translate-x-0.5 active:translate-y-0.5 cursor-pointer flex items-center gap-1 disabled:opacity-60"
             >
-              {savedSuccess ? <Check size={16} /> : 'Save'}
+              {saveState === 'saved' ? <Check size={16} /> : saveState === 'saving' ? 'Saving…' : 'Save'}
             </button>
           </div>
+          {saveState === 'error' && (
+            <p className="mt-1 text-left font-sketch text-[11px] font-bold text-red-600">
+              Could not save this callsign. Use 1–20 letters, numbers, spaces, underscores or hyphens.
+            </p>
+          )}
         </form>
 
         {/* Guest Progress Warning & Login Option */}

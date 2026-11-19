@@ -19,9 +19,10 @@ async function migrate() {
 
     console.log(`Running migration on Neon database (${statements.length} statements)...`);
 
-    for (const statement of statements) {
-      await (sql as any).query(statement);
-    }
+    // One transaction so a failure halfway through cannot leave the derived
+    // leaderboard emptied or flights half-deduplicated.
+    const queries = statements.map((statement) => (sql as any).query(statement));
+    await (sql as any).transaction(queries);
 
     console.log('✅ Migration completed successfully.');
   } catch (error) {

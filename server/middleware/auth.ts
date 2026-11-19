@@ -53,7 +53,7 @@ export async function authMiddleware(
       firebaseUid: player.firebase_uid || null,
       email: player.email || null,
       authProvider: player.auth_provider || 'guest',
-      isGuest: !player.firebase_uid,
+      isGuest: !player.firebase_uid && !player.email,
     };
 
     next();
@@ -96,7 +96,7 @@ export async function optionalAuth(
         firebaseUid: player.firebase_uid || null,
         email: player.email || null,
         authProvider: player.auth_provider || 'guest',
-        isGuest: !player.firebase_uid,
+        isGuest: !player.firebase_uid && !player.email,
       };
     }
   } catch (error) {

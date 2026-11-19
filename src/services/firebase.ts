@@ -45,7 +45,7 @@ import {
   type Firestore,
 } from 'firebase/firestore';
 import type { PilotUser, UserStats } from '../game/types';
-import { checkIsGoogleAccount, syncPilotAccount } from '../api/client';
+import { checkIsGoogleAccount, clearToken, syncPilotAccount } from '../api/client';
 
 // Safely read Vite or Node environment variables
 const env: Record<string, string | undefined> =
@@ -575,6 +575,10 @@ export async function registerWithUsername(
   };
   saveLocalUsers(localUsers);
 
+  // A local-only registration has no server credential. Never let it inherit a
+  // bearer token from whoever was signed in before.
+  clearToken();
+
   const pilotUser: PilotUser = {
     uid,
     username: trimmedUser,
@@ -730,6 +734,10 @@ export async function loginWithUsername(
     return { success: false, error: 'Incorrect password. Please try again.' };
   }
 
+  // Local password auth does not prove ownership to the Neon API. Clear any
+  // previous bearer token instead of silently reusing another account's row.
+  clearToken();
+
   const pilotUser: PilotUser = {
     uid: record.uid,
     username: record.username,
@@ -819,6 +827,9 @@ export async function loginWithGoogle(): Promise<AuthResult> {
 
   // Local fallback: simulate Google login
   const mockUid = 'google-mock-' + Date.now();
+  // No Firebase ID token exists in this mode, so do not inherit an old pilot's
+  // Neon session.
+  clearToken();
   return {
     success: true,
     needsUsername: true,
@@ -828,6 +839,20 @@ export async function loginWithGoogle(): Promise<AuthResult> {
       email: 'pilot@gmail.com',
     },
   };
+}
+
+/**
+ * Return a signed Firebase ID token for the active session, if available.
+ * The token is what lets the Neon API trust the Firebase UID.
+ */
+export async function getFirebaseIdToken(): Promise<string | null> {
+  if (!auth?.currentUser) return null;
+  try {
+    return await auth.currentUser.getIdToken();
+  } catch (err) {
+    console.warn('Could not read Firebase ID token:', err);
+    return null;
+  }
 }
 
 /**
@@ -914,8 +939,13 @@ export async function completeGoogleRegistration(
     recordGoogleEmail(effectiveEmail);
   }
 
-  // Sync pilot account with Neon DB as google auth provider
-  syncPilotAccount(uid, trimmed, effectiveEmail, 'google').catch(() => {});
+  // Sync pilot account with Neon DB using a verified Firebase ID token.
+  if (auth?.currentUser) {
+    const idToken = await getFirebaseIdToken();
+    if (idToken) {
+      syncPilotAccount(uid, trimmed, effectiveEmail, 'google', idToken).catch(() => {});
+    }
+  }
 
   const pilotUser: PilotUser = {
     uid,

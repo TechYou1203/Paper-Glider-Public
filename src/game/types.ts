@@ -81,6 +81,8 @@ export interface DailyChallenge {
 
 export interface LeaderboardEntry {
   id: string;
+  playerId?: string;
+  rank?: number;
   callsign: string;
   score: number;
   clips: number;
@@ -88,6 +90,7 @@ export interface LeaderboardEntry {
   planeSkin: string;
   country: string;
   isPlayer?: boolean;
+  achievedAt?: string;
 }
 
 export interface PilotUser {
@@ -178,7 +181,10 @@ export interface FlightSession extends FlightStartResponse {
 export interface FlightInput {
   /** Zero-based fixed tick; at most one flap per tick. */
   frame: number;
-  action: 'flap';
+  action: 'flap' | 'resize';
+  /** World size for resize events, captured when the viewport changes. */
+  width?: number;
+  height?: number;
 }
 
 // ─── Server API Types ───────────────────────────────────────
@@ -190,9 +196,14 @@ export interface ServerPlayer {
   paperclips: number;
   unlockedSkins: string[];
   soundEnabled: boolean;
-  highScore: number;
-  totalFlights: number;
-  totalPencilsCleared: number;
+  // Optional: the authenticated player payload does not aggregate flight stats
+  // on every request. The official leaderboard is the source of ranked scores.
+  highScore?: number;
+  totalFlights?: number;
+  totalPencilsCleared?: number;
+  email?: string | null;
+  firebaseUid?: string | null;
+  isGuest?: boolean;
 }
 
 export interface PlayerResponse {
@@ -216,6 +227,10 @@ export interface ServerLeaderboardEntry {
 
 export interface LeaderboardResponse {
   entries: ServerLeaderboardEntry[];
+  playerEntry: ServerLeaderboardEntry | null;
+  playerRank: number | null;
+  totalPlayers: number;
+  date: string;
 }
 
 export interface DailyChallengesResponse {
@@ -247,6 +262,10 @@ export interface FlightSubmitResponse {
   score: number;
   clipsCollected: number;
   rank: number | null;
+  dailyRank?: number | null;
+  paperclips?: number;
+  isGuest?: boolean;
+  date?: string;
   player?: ServerPlayer;
   message?: string;
 }

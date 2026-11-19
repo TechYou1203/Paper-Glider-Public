@@ -6,6 +6,7 @@
 import type {
   FlightStartResponse,
   FlightSubmitResponse,
+  LeaderboardResponse,
   ServerLeaderboardEntry,
   ServerPlayer,
   FlightInput,
@@ -14,6 +15,18 @@ import type {
 
 const API_BASE = typeof window !== 'undefined' ? '/api' : 'http://localhost:3001/api';
 const TOKEN_KEY = 'paper_glider_auth_token';
+const REQUEST_TIMEOUT_MS = 15_000;
+
+/**
+ * A stalled request must never leave the flight deck waiting forever. Callers
+ * that need a shorter budget pass their own signal.
+ */
+function fetchWithTimeout(input: RequestInfo | URL, init: RequestInit = {}): Promise<Response> {
+  return fetch(input, {
+    ...init,
+    signal: init.signal ?? AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+  });
+}
 
 let cachedToken: string | null = null;
 let serverOnline: boolean | null = null;
@@ -68,6 +81,14 @@ export function clearToken() {
   }
 }
 
+function authHeaders(): Record<string, string> {
+  const token = getToken();
+  return {
+    'Content-Type': 'application/json',
+    ...(token ? { Authorization: `Bearer ${token}` } : {}),
+  };
+}
+
 async function apiFetch<T>(
   path: string,
   options: RequestInit = {}
@@ -82,10 +103,13 @@ async function apiFetch<T>(
   }
 
   try {
-    const res = await fetch(`${API_BASE}${path}`, {
+    const res = await fetchWithTimeout(`${API_BASE}${path}`, {
       ...options,
       headers,
     });
+    // Any HTTP response proves the API is reachable, even if it is a rejection.
+    // Callers use isServerOnline() to decide whether a local fallback is safe.
+    updateServerStatus(true);
     if (!res.ok) {
       if (res.status === 401) {
         clearToken();
@@ -93,7 +117,6 @@ async function apiFetch<T>(
       console.warn(`API ${path} returned ${res.status}`);
       return null;
     }
-    updateServerStatus(true);
     return (await res.json()) as T;
   } catch (err) {
     console.warn(`API fetch error on ${path}:`, err);
@@ -113,7 +136,7 @@ export interface ServerConnectResult {
 
 export async function checkServerHealth(timeoutMs = 9000): Promise<boolean> {
   try {
-    const res = await fetch(`${API_BASE}/health`, { signal: AbortSignal.timeout(timeoutMs) });
+    const res = await fetchWithTimeout(`${API_BASE}/health`, { signal: AbortSignal.timeout(timeoutMs) });
     if (!res.ok) {
       updateServerStatus(false);
       return false;
@@ -143,7 +166,7 @@ export function isServerOnline(): boolean {
 
 export async function registerGuest(callsign?: string): Promise<ServerPlayer | null> {
   try {
-    const res = await fetch(`${API_BASE}/auth/guest`, {
+    const res = await fetchWithTimeout(`${API_BASE}/auth/guest`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ callsign }),
@@ -161,12 +184,25 @@ export async function registerGuest(callsign?: string): Promise<ServerPlayer | n
   }
 }
 
-export async function loginWithToken(): Promise<ServerPlayer | null> {
+export interface TokenSessionResult {
+  player: ServerPlayer | null;
+  /** The token is absent or the server definitively rejected it. */
+  invalid: boolean;
+  /** False only when the server could not be reached at all. */
+  reachable: boolean;
+}
+
+/**
+ * Distinguishes "this token is no longer valid" from "the server had a bad
+ * moment". Only the former may clear the saved session; a transient 5xx or
+ * network failure must never replace a pilot with a fresh guest account.
+ */
+export async function loginWithTokenDetailed(): Promise<TokenSessionResult> {
   const token = getToken();
-  if (!token) return null;
+  if (!token) return { player: null, invalid: true, reachable: true };
 
   try {
-    const res = await fetch(`${API_BASE}/auth/login`, {
+    const res = await fetchWithTimeout(`${API_BASE}/auth/login`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -174,28 +210,40 @@ export async function loginWithToken(): Promise<ServerPlayer | null> {
       },
       body: JSON.stringify({ token }),
     });
-    if (res.status === 401 || !res.ok) {
+    updateServerStatus(true);
+
+    if (res.status === 401) {
       clearToken();
-      return null;
+      return { player: null, invalid: true, reachable: true };
+    }
+    if (!res.ok) {
+      return { player: null, invalid: false, reachable: true };
     }
     const data = await res.json().catch(() => null);
     if (data?.player) {
-      updateServerStatus(true);
-      return data.player;
+      return { player: data.player, invalid: false, reachable: true };
     }
-    return null;
+    return { player: null, invalid: false, reachable: true };
   } catch {
-    return null;
+    updateServerStatus(false);
+    return { player: null, invalid: false, reachable: false };
   }
+}
+
+export async function loginWithToken(): Promise<ServerPlayer | null> {
+  return (await loginWithTokenDetailed()).player;
 }
 
 /**
  * Re-trigger server connection and auth with detailed feedback for users and UI.
  */
-export async function reconnectServerWithDetails(callsign?: string): Promise<ServerConnectResult> {
+export async function reconnectServerWithDetails(
+  callsign?: string,
+  allowCreateGuest = true
+): Promise<ServerConnectResult> {
   let data: any = null;
   try {
-    const res = await fetch(`${API_BASE}/health`, { signal: AbortSignal.timeout(9000) });
+    const res = await fetchWithTimeout(`${API_BASE}/health`, { signal: AbortSignal.timeout(9000) });
     if (!res.ok) {
       updateServerStatus(false);
       return {
@@ -233,20 +281,42 @@ export async function reconnectServerWithDetails(callsign?: string): Promise<Ser
   }
 
   // Neon DB is connected or reachable
-  let player = await loginWithToken();
-  if (player) {
+  const session = await loginWithTokenDetailed();
+  if (session.player) {
     updateServerStatus(true);
     return {
       success: true,
       databaseStatus: 'connected',
       message: 'Connected to Neon DB! Cloud flight verification active.',
-      player,
+      player: session.player,
+    };
+  }
+
+  // A 5xx or network error is not proof that the token is bad. Preserve the
+  // pilot's session and let them retry instead of creating a new guest row.
+  if (!session.invalid) {
+    updateServerStatus(session.reachable);
+    return {
+      success: false,
+      databaseStatus: session.reachable ? 'connected' : 'unreachable',
+      message: session.reachable
+        ? 'Your saved session could not be verified right now. Please retry; your progress is safe.'
+        : 'Cannot reach backend server. Please verify your internet connection and Vercel deployment.',
     };
   }
 
   // Token was absent or expired; register/sync with pilot's callsign
   clearToken();
-  player = await registerGuest(callsign);
+  if (!allowCreateGuest) {
+    updateServerStatus(false);
+    return {
+      success: false,
+      databaseStatus: 'connected',
+      message: 'No active server session was found. Please sign in again.',
+    };
+  }
+
+  const player = await registerGuest(callsign);
   if (player) {
     updateServerStatus(true);
     return {
@@ -288,11 +358,12 @@ export async function syncPilotAccount(
   firebaseUid: string,
   callsign: string,
   email?: string,
-  authProvider?: string
+  authProvider?: string,
+  idToken?: string
 ): Promise<ServerPlayer | null> {
   const data = await apiFetch<{ token: string; player: ServerPlayer }>('/auth/sync-pilot', {
     method: 'POST',
-    body: JSON.stringify({ firebaseUid, callsign, email, authProvider }),
+    body: JSON.stringify({ firebaseUid, callsign, email, authProvider, idToken }),
   });
   if (data?.token) {
     setToken(data.token);
@@ -319,22 +390,27 @@ export async function checkIsGoogleAccount(identifier: string): Promise<boolean>
 /**
  * Permanently delete pilot account and all associated records from Neon DB.
  */
-export async function deleteServerAccount(firebaseUid?: string, callsign?: string): Promise<boolean> {
+export async function deleteServerAccount(): Promise<boolean> {
   const token = getToken();
   try {
-    const res = await fetch(`${API_BASE}/auth/account`, {
+    const res = await fetchWithTimeout(`${API_BASE}/auth/account`, {
       method: 'DELETE',
       headers: {
         'Content-Type': 'application/json',
         ...(token ? { Authorization: `Bearer ${token}` } : {}),
       },
-      body: JSON.stringify({ firebaseUid, callsign, token }),
     });
-    clearToken();
-    return res.ok;
+    if (res.ok) {
+      clearToken();
+      return true;
+    }
+    if (res.status === 401) {
+      clearToken();
+    }
+    console.warn(`Delete server account returned ${res.status}`);
+    return false;
   } catch (err) {
     console.warn('Delete server account failed:', err);
-    clearToken();
     return false;
   }
 }
@@ -354,9 +430,9 @@ export async function sendVerificationCode(
   username?: string;
 }> {
   try {
-    const res = await fetch(`${API_BASE}/auth/send-verification-code`, {
+    const res = await fetchWithTimeout(`${API_BASE}/auth/send-verification-code`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: authHeaders(),
       body: JSON.stringify({ email, username, type }),
     });
     const data = await res.json().catch(() => ({}));
@@ -389,10 +465,10 @@ export async function verifyAuthCode(
   error?: string;
 }> {
   try {
-    const res = await fetch(`${API_BASE}/auth/verify-code`, {
+    const res = await fetchWithTimeout(`${API_BASE}/auth/verify-code`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email, code, username, type }),
+      headers: authHeaders(),
+      body: JSON.stringify({ email, code }),
     });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) {
@@ -414,10 +490,15 @@ export async function verifyAuthCode(
 
 // ─── Flights ────────────────────────────────────────────────
 
-export async function startFlight(seed?: string, skinUsed?: string): Promise<FlightStartResponse | null> {
+export async function startFlight(
+  seed?: string,
+  skinUsed?: string,
+  worldWidth?: number,
+  worldHeight?: number
+): Promise<FlightStartResponse | null> {
   return apiFetch<FlightStartResponse>('/flights/start', {
     method: 'POST',
-    body: JSON.stringify({ seed, skinUsed }),
+    body: JSON.stringify({ seed, skinUsed, worldWidth, worldHeight }),
   });
 }
 
@@ -456,54 +537,120 @@ export async function submitFlightDirect(
 
 export async function fetchLeaderboard(
   limit = 100
-): Promise<ServerLeaderboardEntry[] | null> {
-  const data = await apiFetch<{ entries: ServerLeaderboardEntry[] } | ServerLeaderboardEntry[]>(
+): Promise<LeaderboardResponse | null> {
+  const data = await apiFetch<LeaderboardResponse | ServerLeaderboardEntry[]>(
     `/leaderboard?limit=${limit}`
   );
   if (!data) return null;
-  if (Array.isArray(data)) return data;
-  return data.entries ?? null;
+  if (Array.isArray(data)) {
+    return {
+      entries: data,
+      playerEntry: null,
+      playerRank: null,
+      totalPlayers: data.length,
+      date: new Date().toISOString().slice(0, 10),
+    };
+  }
+  return {
+    entries: Array.isArray(data.entries) ? data.entries : [],
+    playerEntry: data.playerEntry ?? null,
+    playerRank: data.playerRank ?? null,
+    totalPlayers: Number(data.totalPlayers) || 0,
+    date: data.date || new Date().toISOString().slice(0, 10),
+  };
 }
 
 export async function fetchDailyLeaderboard(
-  limit = 100
-): Promise<ServerLeaderboardEntry[] | null> {
-  const data = await apiFetch<{ entries: ServerLeaderboardEntry[] } | ServerLeaderboardEntry[]>(
-    `/leaderboard/daily?limit=${limit}`
+  limit = 100,
+  date?: string
+): Promise<LeaderboardResponse | null> {
+  // The daily endpoint is date-addressed. Always send the UTC day explicitly so
+  // the "Today" tab can never request an argument-less URL and come back empty.
+  const day = date || new Date().toISOString().slice(0, 10);
+  const query = new URLSearchParams({ limit: String(limit), date: day });
+  const data = await apiFetch<LeaderboardResponse | ServerLeaderboardEntry[]>(
+    `/leaderboard/daily?${query.toString()}`
   );
   if (!data) return null;
-  if (Array.isArray(data)) return data;
-  return data.entries ?? null;
+  if (Array.isArray(data)) {
+    return {
+      entries: data,
+      playerEntry: null,
+      playerRank: null,
+      totalPlayers: data.length,
+      date: date || new Date().toISOString().slice(0, 10),
+    };
+  }
+  return {
+    entries: Array.isArray(data.entries) ? data.entries : [],
+    playerEntry: data.playerEntry ?? null,
+    playerRank: data.playerRank ?? null,
+    totalPlayers: Number(data.totalPlayers) || 0,
+    date: data.date || date || new Date().toISOString().slice(0, 10),
+  };
 }
 
 // ─── Challenges ─────────────────────────────────────────────
 
+interface RawDailyChallenge {
+  id: string;
+  type?: DailyChallenge['type'];
+  title?: string;
+  description?: string;
+  target?: number;
+  targetCount?: number;
+  reward?: number;
+  rewardClips?: number;
+  currentCount?: number;
+  completed?: boolean;
+  claimed?: boolean;
+}
+
+const CHALLENGE_TITLES: Record<string, string> = {
+  pass_pencils: 'Pencil Dodger',
+  collect_clips: 'Stationery Scavenger',
+  reach_score: 'Master Aeronaut',
+};
+
 export async function fetchDailyChallenges(): Promise<DailyChallenge[] | null> {
-  const data = await apiFetch<{ challenges: DailyChallenge[] } | DailyChallenge[]>(
+  const data = await apiFetch<{ challenges: RawDailyChallenge[] } | RawDailyChallenge[]>(
     '/challenges/daily'
   );
   if (!data) return null;
-  if (Array.isArray(data)) return data;
-  return data.challenges ?? null;
+  const list = Array.isArray(data) ? data : data.challenges;
+  if (!Array.isArray(list)) return null;
+
+  return list.map((challenge) => {
+    const type = (challenge.type || 'pass_pencils') as DailyChallenge['type'];
+    const target = Number(challenge.targetCount ?? challenge.target) || 0;
+    return {
+      id: challenge.id,
+      type,
+      title: challenge.title || CHALLENGE_TITLES[type] || 'Daily Challenge',
+      description: challenge.description || '',
+      targetCount: target,
+      currentCount: Number(challenge.currentCount) || 0,
+      rewardClips: Number(challenge.rewardClips ?? challenge.reward) || 0,
+      completed: Boolean(challenge.completed),
+      claimed: Boolean(challenge.claimed),
+    };
+  });
 }
 
 export async function claimChallenge(
   challengeId: string
-): Promise<{ paperclips: number } | null> {
-  return apiFetch<{ paperclips: number }>(`/challenges/${challengeId}/claim`, {
+): Promise<{ paperclips: number; reward?: number } | null> {
+  return apiFetch<{ paperclips: number; reward?: number }>(`/challenges/${challengeId}/claim`, {
     method: 'POST',
   });
 }
 
 // ─── Inventory ──────────────────────────────────────────────
 
-export async function unlockSkin(
-  skinId: string,
-  cost: number
-): Promise<ServerPlayer | null> {
+export async function unlockSkin(skinId: string): Promise<ServerPlayer | null> {
   const data = await apiFetch<{ player: ServerPlayer } | ServerPlayer>('/inventory/unlock', {
     method: 'POST',
-    body: JSON.stringify({ skinId, cost }),
+    body: JSON.stringify({ skinId }),
   });
   if (!data) return null;
   return 'player' in data ? data.player : data;

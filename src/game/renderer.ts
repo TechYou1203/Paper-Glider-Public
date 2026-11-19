@@ -444,7 +444,9 @@ export function drawPaperPlane(
   ctx: CanvasRenderingContext2D,
   plane: PlayerPlane,
   skin: GliderSkin,
-  isShielded: boolean = false
+  isShielded: boolean = false,
+  renderOffsetY: number = 0,
+  renderOffsetPitch: number = 0
 ) {
   // 1. Draw dashed pencil trajectory flight trail
   if (plane.trail.length > 1) {
@@ -465,8 +467,8 @@ export function drawPaperPlane(
 
   // 2. Draw Paper Glider Body
   ctx.save();
-  ctx.translate(plane.x, plane.y);
-  ctx.rotate(plane.pitch);
+  ctx.translate(plane.x, plane.y + renderOffsetY);
+  ctx.rotate(plane.pitch + renderOffsetPitch);
 
   // Shield aura when drafting tape shield power-up is active
   if (isShielded) {

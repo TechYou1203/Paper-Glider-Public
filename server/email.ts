@@ -174,7 +174,12 @@ export async function sendVerificationEmail({
   }
 
   // 3. Fallback simulation (when no SMTP credentials are configured yet in environment)
-  console.log(`[Paper Glider Auth] Verification Code for ${email} (${username}): ${code}`);
+  if (process.env.NODE_ENV === 'production') {
+    // A one-time code in production logs is a credential leak. Fail closed.
+    console.warn('[Paper Glider Auth] SMTP is not configured; no verification email was sent.');
+  } else {
+    console.log(`[Paper Glider Auth] Verification Code for ${email} (${username}): ${code}`);
+  }
   return {
     sent: false,
     simulated: true,

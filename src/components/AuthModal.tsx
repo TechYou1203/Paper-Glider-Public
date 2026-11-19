@@ -27,7 +27,7 @@ import {
   completeVerifiedEmailAuth,
   isGoogleRegisteredEmail,
 } from '../services/firebase';
-import { sendVerificationCode, verifyAuthCode, syncPilotAccount } from '../api/client';
+import { sendVerificationCode, verifyAuthCode } from '../api/client';
 import type { PilotUser } from '../game/types';
 
 interface AuthModalProps {
@@ -233,8 +233,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
       );
 
       if (authRes.success && authRes.user) {
-        // 3. Link pilot with Neon DB
-        await syncPilotAccount(authRes.user.uid, authRes.user.username, authRes.user.email, 'otp').catch(() => {});
+        // App.handleAuthSuccess links the verified account with Neon.
         onSuccess(authRes.user);
       } else {
         setErrorMessage(authRes.error || 'Failed to finalize pilot profile.');
@@ -535,7 +534,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
                   type="text"
                   required
                   minLength={3}
-                  maxLength={24}
+                  maxLength={20}
                   value={username}
                   onChange={(e) => setUsername(e.target.value)}
                   placeholder="e.g. AcePilot99"
@@ -959,7 +958,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
                     type="text"
                     required
                     minLength={3}
-                    maxLength={24}
+                    maxLength={20}
                     value={username}
                     onChange={(e) => setUsername(e.target.value)}
                     placeholder="e.g. MaverickPilot"

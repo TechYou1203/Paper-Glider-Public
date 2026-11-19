@@ -252,3 +252,44 @@ test('guest stats: getInitialUserStats returns clean zeroed stats that do not pe
   assert.equal(stats.selectedSkin, 'classic');
   assert.deepEqual(stats.unlockedSkins, ['classic']);
 });
+
+test('anti-cheat: viewport resize events are replayed on the same tick', () => {
+  const seed = 'resize-replay-parity-seed-42';
+  const sim = createFlightSimulation(seed, 'classic', 800, 600);
+  const inputs: Array<{ frame: number; action: 'resize'; width: number; height: number }> = [
+    { frame: 20, action: 'resize', width: 1180, height: 820 },
+    { frame: 70, action: 'resize', width: 640, height: 900 },
+  ];
+  let inputIndex = 0;
+
+  for (let frame = 0; frame < 240; frame++) {
+    while (inputIndex < inputs.length && inputs[inputIndex].frame === sim.frameCount) {
+      const resize = inputs[inputIndex++];
+      sim.worldWidth = resize.width;
+      sim.worldHeight = resize.height;
+    }
+    const events = stepFlightSimulation(sim, frame % 18 === 0);
+    if (events.crashed) break;
+  }
+
+  const result = verifyReplay(seed, inputs, sim.score, 'classic', 800, 600);
+  assert.equal(result.valid, true);
+  assert.equal(result.replayScore, sim.score);
+  assert.equal(result.replayClips, sim.clipsCollected);
+});
+
+test('ranking: exact ties share a competition rank and identify the viewer', async () => {
+  const { assignRanks } = await import('../../server/ranking');
+  const achievedAt = '2026-01-01T00:00:00.000Z';
+  const rows = [
+    { player_id: 'a', callsign: 'Alpha', score: 10, clips: 2, skin: 'classic', achieved_at: achievedAt },
+    { player_id: 'b', callsign: 'Bravo', score: 10, clips: 2, skin: 'classic', achieved_at: achievedAt },
+    { player_id: 'c', callsign: 'Charlie', score: 9, clips: 8, skin: 'classic', achieved_at: achievedAt },
+    { player_id: 'd', callsign: 'Delta', score: 9, clips: 1, skin: 'classic', achieved_at: achievedAt },
+  ];
+
+  const entries = assignRanks(rows as any, 'b');
+  assert.deepEqual(entries.map((entry) => entry.rank), [1, 1, 3, 4]);
+  assert.equal(entries[1].isPlayer, true);
+  assert.equal(entries[0].isPlayer, false);
+});

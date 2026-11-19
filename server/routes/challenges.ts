@@ -1,27 +1,25 @@
 import { Router, Response } from 'express';
 import { sql } from '../db.js';
 import { authMiddleware, AuthenticatedRequest } from '../middleware/auth.js';
+import { utcDayString } from '../time.js';
 
 const router = Router();
 
-interface DailyChallenge {
+interface ChallengeDefinition {
   id: string;
-  type: string;
+  type: 'pass_pencils' | 'collect_clips' | 'reach_score';
+  title: string;
   description: string;
   target: number;
   reward: number;
-  currentCount: number;
-  completed: boolean;
-  claimed: boolean;
 }
 
-function generateDailyChallenges(dateStr: string): Array<{
-  id: string;
-  type: string;
-  description: string;
-  target: number;
-  reward: number;
-}> {
+interface PlayerMetrics {
+  bestScore: number;
+  totalClips: number;
+}
+
+function generateDailyChallenges(dateStr: string): ChallengeDefinition[] {
   let hash = 0;
   for (let i = 0; i < dateStr.length; i++) {
     hash = (hash << 5) - hash + dateStr.charCodeAt(i);
@@ -37,72 +35,125 @@ function generateDailyChallenges(dateStr: string): Array<{
     {
       id: `pass_pencils_${dateStr}`,
       type: 'pass_pencils',
-      description: `Pass ${passTarget} pencils in a single flight`,
+      title: 'Pencil Dodger',
+      description: `Glide through ${passTarget} pencil barriers in a single flight.`,
       target: passTarget,
       reward: 10,
     },
     {
       id: `collect_clips_${dateStr}`,
       type: 'collect_clips',
-      description: `Collect ${clipTarget} paperclips in a single flight`,
+      title: 'Stationery Scavenger',
+      description: `Collect ${clipTarget} golden paperclips today.`,
       target: clipTarget,
       reward: 15,
     },
     {
       id: `reach_score_${dateStr}`,
       type: 'reach_score',
-      description: `Reach a score of ${scoreTarget}`,
+      title: 'Master Aeronaut',
+      description: `Reach a flight score of ${scoreTarget} points.`,
       target: scoreTarget,
       reward: 25,
     },
   ];
 }
 
-function getTodayDateStr(): string {
-  return new Date().toISOString().split('T')[0];
+async function fetchMetrics(playerId: string, day: string): Promise<PlayerMetrics> {
+  const rows = await sql`
+    SELECT
+      COALESCE(MAX(score), 0)::int AS best_score,
+      COALESCE(SUM(clips_collected), 0)::int AS total_clips
+    FROM flights
+    WHERE player_id = ${playerId}
+      AND verified = true
+      AND verification_version >= 2
+      AND (created_at AT TIME ZONE 'UTC')::date = ${day}::date
+  `;
+  return {
+    bestScore: Number(rows[0]?.best_score) || 0,
+    totalClips: Number(rows[0]?.total_clips) || 0,
+  };
+}
+
+function currentCountFor(challenge: ChallengeDefinition, metrics: PlayerMetrics): number {
+  if (challenge.type === 'collect_clips') return metrics.totalClips;
+  return metrics.bestScore;
+}
+
+function toResponse(
+  challenge: ChallengeDefinition,
+  progress: { currentCount: number; completed: boolean; claimed: boolean }
+) {
+  return {
+    id: challenge.id,
+    type: challenge.type,
+    title: challenge.title,
+    description: challenge.description,
+    target: challenge.target,
+    targetCount: challenge.target,
+    reward: challenge.reward,
+    rewardClips: challenge.reward,
+    currentCount: progress.currentCount,
+    completed: progress.completed,
+    claimed: progress.claimed,
+  };
+}
+
+async function syncProgress(
+  playerId: string,
+  challenges: ChallengeDefinition[],
+  day: string,
+  metrics: PlayerMetrics
+): Promise<Array<{ id: string; currentCount: number; completed: boolean; claimed: boolean }>> {
+  const result: Array<{ id: string; currentCount: number; completed: boolean; claimed: boolean }> = [];
+
+  for (const challenge of challenges) {
+    const currentCount = currentCountFor(challenge, metrics);
+    const completed = currentCount >= challenge.target;
+    const rows = await sql`
+      INSERT INTO daily_challenge_progress (
+        player_id, challenge_date, challenge_id, current_count, completed
+      )
+      VALUES (${playerId}, ${day}::date, ${challenge.id}, ${currentCount}, ${completed})
+      ON CONFLICT (player_id, challenge_id) DO UPDATE SET
+        challenge_date = EXCLUDED.challenge_date,
+        current_count = EXCLUDED.current_count,
+        completed = EXCLUDED.completed OR daily_challenge_progress.claimed
+      RETURNING current_count, completed, claimed
+    `;
+    const row = rows[0];
+    result.push({
+      id: challenge.id,
+      currentCount: Number(row?.current_count) || 0,
+      completed: Boolean(row?.completed),
+      claimed: Boolean(row?.claimed),
+    });
+  }
+
+  return result;
 }
 
 // GET /api/challenges/daily — Get today's challenges with player progress
 router.get('/daily', authMiddleware, async (req: AuthenticatedRequest, res: Response) => {
   try {
     const player = req.player!;
-    const dateStr = getTodayDateStr();
-    const challenges = generateDailyChallenges(dateStr);
+    const day = utcDayString();
+    const definitions = generateDailyChallenges(day);
+    const metrics = await fetchMetrics(player.id, day);
+    const progress = await syncProgress(player.id, definitions, day, metrics);
 
-    // Fetch player's progress for today's challenges
-    const challengeIds = challenges.map((c) => c.id);
-    const progressRows = await sql`
-      SELECT challenge_id, current_count, completed, claimed
-      FROM daily_challenge_progress
-      WHERE player_id = ${player.id}
-        AND challenge_date = CURRENT_DATE
-        AND challenge_id = ANY(${challengeIds})
-    `;
-
-    const progressMap = new Map<string, { currentCount: number; completed: boolean; claimed: boolean }>();
-    for (const row of progressRows) {
-      progressMap.set(row.challenge_id, {
-        currentCount: row.current_count,
-        completed: row.completed,
-        claimed: row.claimed,
-      });
-    }
-
-    const result: DailyChallenge[] = challenges.map((c) => {
-      const progress = progressMap.get(c.id);
-      return {
-        id: c.id,
-        type: c.type,
-        description: c.description,
-        target: c.target,
-        reward: c.reward,
-        currentCount: progress?.currentCount ?? 0,
-        completed: progress?.completed ?? false,
-        claimed: progress?.claimed ?? false,
-      };
+    const byId = new Map(progress.map((entry) => [entry.id, entry]));
+    res.json({
+      date: day,
+      challenges: definitions.map((challenge) =>
+        toResponse(challenge, byId.get(challenge.id) ?? {
+          currentCount: 0,
+          completed: false,
+          claimed: false,
+        })
+      ),
     });
-
-    res.json({ date: dateStr, challenges: result });
   } catch (error) {
     console.error('Daily challenges error:', error);
     res.status(500).json({ error: 'Failed to fetch daily challenges' });
@@ -114,62 +165,61 @@ router.post('/:id/claim', authMiddleware, async (req: AuthenticatedRequest, res:
   try {
     const player = req.player!;
     const challengeId = req.params.id;
-    const dateStr = getTodayDateStr();
-
-    // Find the challenge definition
-    const challenges = generateDailyChallenges(dateStr);
-    const challenge = challenges.find((c) => c.id === challengeId);
+    const day = utcDayString();
+    const definitions = generateDailyChallenges(day);
+    const challenge = definitions.find((entry) => entry.id === challengeId);
 
     if (!challenge) {
       res.status(404).json({ error: 'Challenge not found' });
       return;
     }
 
-    // Check player's progress
-    const progressRows = await sql`
-      SELECT id, completed, claimed
-      FROM daily_challenge_progress
-      WHERE player_id = ${player.id}
-        AND challenge_id = ${challengeId}
-        AND challenge_date = CURRENT_DATE
-    `;
+    const metrics = await fetchMetrics(player.id, day);
+    const currentCount = currentCountFor(challenge, metrics);
+    const completed = currentCount >= challenge.target;
 
-    if (progressRows.length === 0) {
-      res.status(400).json({ error: 'No progress found for this challenge' });
-      return;
-    }
+    await syncProgress(player.id, definitions, day, metrics);
 
-    const progress = progressRows[0];
-
-    if (!progress.completed) {
+    if (!completed) {
       res.status(400).json({ error: 'Challenge not yet completed' });
       return;
     }
 
-    if (progress.claimed) {
+    // Marking the reward claimed and granting the paperclips must happen in one
+    // statement. Otherwise a process failure between the two steps would consume
+    // the reward without paying it.
+    const claimed = await sql`
+      WITH claimed AS (
+        UPDATE daily_challenge_progress
+        SET claimed = true
+        WHERE player_id = ${player.id}
+          AND challenge_id = ${challengeId}
+          AND completed = true
+          AND claimed = false
+        RETURNING id
+      ), rewarded AS (
+        UPDATE players
+        SET paperclips = COALESCE(paperclips, 0) + ${challenge.reward},
+            updated_at = NOW()
+        WHERE id = ${player.id}
+          AND EXISTS (SELECT 1 FROM claimed)
+        RETURNING paperclips
+      )
+      SELECT
+        (SELECT COUNT(*)::int FROM claimed) AS claimed_count,
+        (SELECT paperclips FROM rewarded) AS paperclips
+    `;
+
+    if (Number(claimed[0]?.claimed_count) !== 1) {
       res.status(409).json({ error: 'Reward already claimed' });
       return;
     }
 
-    // Mark as claimed
-    await sql`
-      UPDATE daily_challenge_progress
-      SET claimed = true
-      WHERE id = ${progress.id}
-    `;
-
-    // Add reward paperclips to player
-    const updatedPlayer = await sql`
-      UPDATE players
-      SET paperclips = paperclips + ${challenge.reward}, updated_at = NOW()
-      WHERE id = ${player.id}
-      RETURNING paperclips
-    `;
-
     res.json({
+      success: true,
       claimed: true,
       reward: challenge.reward,
-      paperclips: updatedPlayer[0].paperclips,
+      paperclips: Number(claimed[0]?.paperclips) || 0,
     });
   } catch (error) {
     console.error('Claim challenge error:', error);

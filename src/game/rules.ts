@@ -101,7 +101,7 @@ export function generateDailyChallenges(dateStr: string): DailyChallenge[] {
 
   return [
     {
-      id: `${dateStr}-pencils`,
+      id: `pass_pencils_${dateStr}`,
       title: 'Pencil Dodger',
       description: `Glide through ${targets[0].target} pencil barriers in a single flight.`,
       targetCount: targets[0].target,
@@ -112,7 +112,7 @@ export function generateDailyChallenges(dateStr: string): DailyChallenge[] {
       type: 'pass_pencils',
     },
     {
-      id: `${dateStr}-clips`,
+      id: `collect_clips_${dateStr}`,
       title: 'Stationery Scavenger',
       description: `Collect ${targets[1].target} golden paperclips today.`,
       targetCount: targets[1].target,
@@ -123,7 +123,7 @@ export function generateDailyChallenges(dateStr: string): DailyChallenge[] {
       type: 'collect_clips',
     },
     {
-      id: `${dateStr}-score`,
+      id: `reach_score_${dateStr}`,
       title: 'Master Aeronaut',
       description: `Reach a flight score of ${targets[2].target} points.`,
       targetCount: targets[2].target,

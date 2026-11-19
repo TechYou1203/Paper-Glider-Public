@@ -28861,6 +28861,67 @@ var HttpError = class extends Error {
     this.status = status;
   }
 };
+function callsignValue(value) {
+  if (typeof value !== "string" || !/^[\p{L}\p{N} _-]{1,20}$/u.test(value.trim())) {
+    throw new HttpError(400, "Callsign must contain 1\u201320 letters, numbers, spaces, underscores or hyphens.");
+  }
+  return value.trim();
+}
+function uuidValue(value) {
+  if (typeof value !== "string" || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value)) {
+    throw new HttpError(400, "Invalid flight ID.");
+  }
+  return value;
+}
+function rateLimit(limit, windowMs = 6e4) {
+  const MAX_CLIENTS = 2e4;
+  const clients = /* @__PURE__ */ new Map();
+  function makeRoom(now) {
+    for (const [key, record] of clients) {
+      if (record.until <= now) clients.delete(key);
+    }
+    while (clients.size >= MAX_CLIENTS) {
+      const oldest = clients.keys().next().value;
+      if (oldest === void 0) break;
+      clients.delete(oldest);
+    }
+  }
+  return (req, res, next) => {
+    const now = Date.now();
+    if (clients.size >= MAX_CLIENTS) makeRoom(now);
+    const key = req.ip || "unknown";
+    let record = clients.get(key);
+    if (!record || record.until <= now) {
+      record = { count: 0, until: now + windowMs };
+      clients.set(key, record);
+    } else {
+      clients.delete(key);
+      clients.set(key, record);
+    }
+    if (++record.count > limit) {
+      res.setHeader("Retry-After", Math.ceil((record.until - now) / 1e3));
+      res.status(429).json({ error: "Too many requests. Please try again shortly." });
+      return;
+    }
+    next();
+  };
+}
+var errorHandler = (error2, _req, res, _next) => {
+  if (error2 instanceof HttpError) {
+    res.status(error2.status).json({ error: error2.message });
+    return;
+  }
+  if (error2?.type === "entity.too.large") {
+    res.status(413).json({ error: "Request body is too large." });
+    return;
+  }
+  if (error2?.type === "entity.parse.failed") {
+    res.status(400).json({ error: "Request body must be valid JSON." });
+    return;
+  }
+  console.error("API operation failed:", typeof error2?.code === "string" ? error2.code : "internal");
+  res.status(503).json({ error: "The service is unavailable. Please try again later." });
+};
 
 // server/db.ts
 var connection = null;
@@ -42016,7 +42077,11 @@ If you did not receive this email in your inbox, please check your spam folder i
       };
     }
   }
-  console.log(`[Paper Glider Auth] Verification Code for ${email} (${username}): ${code}`);
+  if (process.env.NODE_ENV === "production") {
+    console.warn("[Paper Glider Auth] SMTP is not configured; no verification email was sent.");
+  } else {
+    console.log(`[Paper Glider Auth] Verification Code for ${email} (${username}): ${code}`);
+  }
   return {
     sent: false,
     simulated: true,
@@ -42024,376 +42089,45 @@ If you did not receive this email in your inbox, please check your spam folder i
   };
 }
 
-// server/routes/auth.ts
-var router = (0, import_express.Router)();
-router.post("/guest", async (req, res) => {
-  try {
-    const { callsign } = req.body || {};
-    const playerCallsign = callsign || `Pilot${Math.floor(100 + Math.random() * 900)}`;
-    const guestToken = crypto9.randomUUID();
-    const rows = await sql`
-      INSERT INTO players (guest_token, callsign)
-      VALUES (${guestToken}, ${playerCallsign})
-      RETURNING id, callsign, equipped_skin, paperclips, unlocked_skins, sound_enabled
-    `;
-    const player = rows[0];
-    res.status(201).json({
-      token: guestToken,
-      player: {
-        id: player.id,
-        callsign: player.callsign,
-        equippedSkin: player.equipped_skin,
-        paperclips: player.paperclips,
-        unlockedSkins: player.unlocked_skins,
-        soundEnabled: player.sound_enabled
-      }
-    });
-  } catch (error2) {
-    console.error("Guest auth error:", error2);
-    res.status(500).json({ error: "Failed to create guest account" });
+// server/firebaseAuth.ts
+async function verifyFirebaseIdToken(idToken) {
+  if (typeof idToken !== "string" || idToken.length < 20) {
+    throw new HttpError(401, "A valid Firebase session is required.");
   }
-});
-router.post("/login", async (req, res) => {
-  try {
-    const { token } = req.body || {};
-    if (!token) {
-      res.status(400).json({ error: "Token is required" });
-      return;
-    }
-    const rows = await sql`
-      SELECT id, callsign, equipped_skin, paperclips, unlocked_skins, sound_enabled
-      FROM players
-      WHERE guest_token = ${token}
-    `;
-    if (rows.length === 0) {
-      res.status(401).json({ error: "Invalid token" });
-      return;
-    }
-    const player = rows[0];
-    res.json({
-      player: {
-        id: player.id,
-        callsign: player.callsign,
-        equippedSkin: player.equipped_skin,
-        paperclips: player.paperclips,
-        unlockedSkins: player.unlocked_skins,
-        soundEnabled: player.sound_enabled
-      }
-    });
-  } catch (error2) {
-    console.error("Login error:", error2);
-    res.status(500).json({ error: "Failed to log in" });
+  const apiKey = process.env.FIREBASE_API_KEY || process.env.VITE_FIREBASE_API_KEY;
+  if (!apiKey) {
+    throw new HttpError(503, "Firebase authentication is not configured on this server.");
   }
-});
-router.post("/sync-pilot", async (req, res) => {
+  let response;
   try {
-    const { firebaseUid, callsign, email, authProvider } = req.body || {};
-    if (!firebaseUid || !callsign) {
-      res.status(400).json({ error: "firebaseUid and callsign are required" });
-      return;
-    }
-    const cleanEmail = email ? String(email).trim().toLowerCase() : null;
-    const provider = authProvider || "firebase";
-    if (provider === "google" && cleanEmail) {
-      await sql`
-        INSERT INTO google_accounts (email, firebase_uid, callsign, updated_at)
-        VALUES (${cleanEmail}, ${firebaseUid}, ${callsign}, NOW())
-        ON CONFLICT (email) DO UPDATE
-        SET firebase_uid = ${firebaseUid}, callsign = ${callsign}, updated_at = NOW()
-      `;
-    }
-    let rows = await sql`
-      SELECT id, guest_token, callsign, equipped_skin, paperclips, unlocked_skins, sound_enabled
-      FROM players
-      WHERE firebase_uid = ${firebaseUid}
-    `;
-    if (rows.length > 0) {
-      rows = await sql`
-        UPDATE players
-        SET callsign = ${callsign},
-            email = COALESCE(${cleanEmail}, email),
-            auth_provider = COALESCE(${provider}, auth_provider),
-            updated_at = NOW()
-        WHERE firebase_uid = ${firebaseUid}
-        RETURNING id, guest_token, callsign, equipped_skin, paperclips, unlocked_skins, sound_enabled
-      `;
-      const player2 = rows[0];
-      res.json({
-        token: player2.guest_token,
-        player: {
-          id: player2.id,
-          callsign: player2.callsign,
-          equippedSkin: player2.equipped_skin,
-          paperclips: player2.paperclips,
-          unlockedSkins: player2.unlocked_skins,
-          soundEnabled: player2.sound_enabled
-        }
-      });
-      return;
-    }
-    const guestToken = crypto9.randomUUID();
-    rows = await sql`
-      INSERT INTO players (guest_token, firebase_uid, callsign, email, auth_provider)
-      VALUES (${guestToken}, ${firebaseUid}, ${callsign}, ${cleanEmail}, ${provider})
-      RETURNING id, guest_token, callsign, equipped_skin, paperclips, unlocked_skins, sound_enabled
-    `;
-    const player = rows[0];
-    res.status(201).json({
-      token: player.guest_token,
-      player: {
-        id: player.id,
-        callsign: player.callsign,
-        equippedSkin: player.equipped_skin,
-        paperclips: player.paperclips,
-        unlockedSkins: player.unlocked_skins,
-        soundEnabled: player.sound_enabled
+    response = await fetch(
+      `https://identitytoolkit.googleapis.com/v1/accounts:lookup?key=${encodeURIComponent(apiKey)}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ idToken }),
+        signal: AbortSignal.timeout(8e3)
       }
-    });
-  } catch (error2) {
-    console.error("Sync pilot error:", error2);
-    res.status(500).json({ error: "Failed to sync pilot account" });
+    );
+  } catch {
+    throw new HttpError(503, "Could not reach Firebase to verify this session.");
   }
-});
-router.get("/check-google", async (req, res) => {
-  try {
-    const email = req.query.email?.trim().toLowerCase();
-    const identifier = req.query.identifier?.trim().toLowerCase();
-    const queryVal = email || identifier;
-    if (!queryVal) {
-      res.json({ isGoogle: false });
-      return;
-    }
-    if (queryVal.includes("@")) {
-      const rows = await sql`
-        SELECT email FROM google_accounts
-        WHERE LOWER(email) = LOWER(${queryVal})
-        LIMIT 1
-      `;
-      if (rows.length > 0) {
-        res.json({ isGoogle: true, message: "This account is registered with Google. Try signing in with Google." });
-        return;
-      }
-      const pRows = await sql`
-        SELECT id FROM players
-        WHERE LOWER(email) = LOWER(${queryVal}) AND auth_provider = 'google'
-        LIMIT 1
-      `;
-      if (pRows.length > 0) {
-        res.json({ isGoogle: true, message: "This account is registered with Google. Try signing in with Google." });
-        return;
-      }
-    } else {
-      const rows = await sql`
-        SELECT email FROM google_accounts
-        WHERE LOWER(callsign) = LOWER(${queryVal})
-        LIMIT 1
-      `;
-      if (rows.length > 0) {
-        res.json({ isGoogle: true, message: "This account is registered with Google. Try signing in with Google." });
-        return;
-      }
-      const pRows = await sql`
-        SELECT id FROM players
-        WHERE LOWER(callsign) = LOWER(${queryVal}) AND auth_provider = 'google'
-        LIMIT 1
-      `;
-      if (pRows.length > 0) {
-        res.json({ isGoogle: true, message: "This account is registered with Google. Try signing in with Google." });
-        return;
-      }
-    }
-    res.json({ isGoogle: false });
-  } catch (err) {
-    console.error("Check google error:", err);
-    res.json({ isGoogle: false });
+  if (!response.ok) {
+    throw new HttpError(401, "Invalid or expired Firebase session.");
   }
-});
-router.post("/send-verification-code", async (req, res) => {
-  try {
-    const { email, username, type = "signup" } = req.body || {};
-    if (!email || typeof email !== "string" || !email.includes("@")) {
-      res.status(400).json({ error: "Please enter a valid email address." });
-      return;
-    }
-    const trimmedEmail = email.trim().toLowerCase();
-    const cleanUsername = (username || "").trim();
-    if (!cleanUsername || cleanUsername.length < 3) {
-      res.status(400).json({ error: "Username must be at least 3 characters long." });
-      return;
-    }
-    if (!/^[a-zA-Z0-9_-]+$/.test(cleanUsername)) {
-      res.status(400).json({ error: "Username can only contain letters, numbers, underscores, and dashes." });
-      return;
-    }
-    const googleCheck = await sql`
-      SELECT email FROM google_accounts
-      WHERE LOWER(email) = LOWER(${trimmedEmail})
-         OR LOWER(callsign) = LOWER(${cleanUsername})
-      LIMIT 1
-    `;
-    if (googleCheck.length > 0) {
-      res.status(400).json({
-        error: "This account is registered with Google. Try signing in with Google.",
-        isGoogle: true
-      });
-      return;
-    }
-    const playerGoogleCheck = await sql`
-      SELECT id FROM players
-      WHERE (LOWER(email) = LOWER(${trimmedEmail}) OR LOWER(callsign) = LOWER(${cleanUsername}))
-        AND auth_provider = 'google'
-      LIMIT 1
-    `;
-    if (playerGoogleCheck.length > 0) {
-      res.status(400).json({
-        error: "This account is registered with Google. Try signing in with Google.",
-        isGoogle: true
-      });
-      return;
-    }
-    if (type === "signup") {
-      const existing = await sql`
-        SELECT id FROM players
-        WHERE LOWER(callsign) = LOWER(${cleanUsername})
-        LIMIT 1
-      `;
-      if (existing.length > 0) {
-        res.status(400).json({ error: "This username is taken, try a different one." });
-        return;
-      }
-    }
-    const code = Math.floor(1e5 + Math.random() * 9e5).toString();
-    await sql`
-      DELETE FROM verification_codes
-      WHERE email = ${trimmedEmail} AND verified = false
-    `;
-    await sql`
-      INSERT INTO verification_codes (email, username, code, type, expires_at)
-      VALUES (${trimmedEmail}, ${cleanUsername}, ${code}, ${type}, NOW() + INTERVAL '10 minutes')
-    `;
-    await sendVerificationEmail({
-      email: trimmedEmail,
-      username: cleanUsername,
-      code,
-      type
-    });
-    res.json({
-      success: true,
-      message: "Verification code sent to your email address. Please check your inbox and Spam folder.",
-      email: trimmedEmail,
-      username: cleanUsername
-    });
-  } catch (error2) {
-    console.error("Send verification code error:", error2);
-    res.status(500).json({ error: "Failed to send verification code. Please try again." });
+  const data = await response.json().catch(() => null);
+  const user = data?.users?.[0];
+  if (!user?.localId) {
+    throw new HttpError(401, "Invalid or expired Firebase session.");
   }
-});
-router.post("/verify-code", async (req, res) => {
-  try {
-    const { email, code, username, type = "signup" } = req.body || {};
-    if (!email || !code) {
-      res.status(400).json({ error: "Email and verification code are required." });
-      return;
-    }
-    const trimmedEmail = email.trim().toLowerCase();
-    const trimmedCode = code.toString().trim();
-    const rows = await sql`
-      SELECT id, email, username, code, expires_at, verified
-      FROM verification_codes
-      WHERE email = ${trimmedEmail}
-        AND code = ${trimmedCode}
-        AND expires_at > NOW()
-        AND verified = false
-      ORDER BY created_at DESC
-      LIMIT 1
-    `;
-    if (rows.length === 0) {
-      res.status(400).json({
-        error: "Invalid or expired verification code. Please check your Gmail (including Spam folder) and try again."
-      });
-      return;
-    }
-    const verificationRecord = rows[0];
-    await sql`
-      UPDATE verification_codes
-      SET verified = true
-      WHERE id = ${verificationRecord.id}
-    `;
-    const finalCallsign = username?.trim() || verificationRecord.username;
-    let playerRows = await sql`
-      SELECT id, guest_token, callsign, equipped_skin, paperclips, unlocked_skins, sound_enabled
-      FROM players
-      WHERE LOWER(callsign) = LOWER(${finalCallsign})
-      LIMIT 1
-    `;
-    if (playerRows.length === 0) {
-      const guestToken = crypto9.randomUUID();
-      playerRows = await sql`
-        INSERT INTO players (guest_token, callsign)
-        VALUES (${guestToken}, ${finalCallsign})
-        RETURNING id, guest_token, callsign, equipped_skin, paperclips, unlocked_skins, sound_enabled
-      `;
-    }
-    const player = playerRows[0];
-    res.json({
-      success: true,
-      token: player.guest_token,
-      player: {
-        id: player.id,
-        callsign: player.callsign,
-        equippedSkin: player.equipped_skin,
-        paperclips: player.paperclips,
-        unlockedSkins: player.unlocked_skins,
-        soundEnabled: player.sound_enabled
-      }
-    });
-  } catch (error2) {
-    console.error("Verify code error:", error2);
-    res.status(500).json({ error: "Failed to verify code. Please try again." });
-  }
-});
-router.delete("/account", async (req, res) => {
-  try {
-    const { firebaseUid, callsign, token } = req.body || {};
-    const authHeader = req.headers.authorization;
-    const bearerToken = authHeader?.startsWith("Bearer ") ? authHeader.slice(7) : null;
-    const activeToken = token || bearerToken;
-    if (!firebaseUid && !callsign && !activeToken) {
-      res.status(400).json({ error: "Identification required to delete account" });
-      return;
-    }
-    const deleted = await sql`
-      DELETE FROM players
-      WHERE (firebase_uid IS NOT NULL AND firebase_uid = ${firebaseUid || ""})
-         OR (guest_token IS NOT NULL AND guest_token = ${activeToken || ""})
-         OR (callsign IS NOT NULL AND callsign = ${callsign || ""})
-      RETURNING id, callsign, firebase_uid, email
-    `;
-    if (firebaseUid || callsign) {
-      await sql`
-        DELETE FROM google_accounts
-        WHERE (firebase_uid IS NOT NULL AND firebase_uid = ${firebaseUid || ""})
-           OR (callsign IS NOT NULL AND callsign = ${callsign || ""})
-      `;
-      await sql`
-        DELETE FROM verification_codes
-        WHERE (username IS NOT NULL AND username = ${callsign || ""})
-      `;
-    }
-    res.json({
-      success: true,
-      deletedCount: deleted.length,
-      message: "Pilot account and all associated records permanently removed from Neon DB."
-    });
-  } catch (error2) {
-    console.error("Delete account error:", error2);
-    res.status(500).json({ error: "Failed to delete account from Neon DB" });
-  }
-});
-var auth_default = router;
-
-// server/routes/leaderboard.ts
-var import_express2 = __toESM(require_express2(), 1);
+  const providerId = user.providerUserInfo?.[0]?.providerId;
+  return {
+    uid: String(user.localId),
+    email: typeof user.email === "string" ? user.email.trim().toLowerCase() : null,
+    emailVerified: Boolean(user.emailVerified),
+    provider: providerId === "google.com" ? "google" : "firebase"
+  };
+}
 
 // server/middleware/auth.ts
 async function authMiddleware(req, res, next) {
@@ -42424,7 +42158,7 @@ async function authMiddleware(req, res, next) {
       firebaseUid: player.firebase_uid || null,
       email: player.email || null,
       authProvider: player.auth_provider || "guest",
-      isGuest: !player.firebase_uid
+      isGuest: !player.firebase_uid && !player.email
     };
     next();
   } catch (error2) {
@@ -42457,7 +42191,7 @@ async function optionalAuth(req, res, next) {
         firebaseUid: player.firebase_uid || null,
         email: player.email || null,
         authProvider: player.auth_provider || "guest",
-        isGuest: !player.firebase_uid
+        isGuest: !player.firebase_uid && !player.email
       };
     }
   } catch (error2) {
@@ -42466,30 +42200,841 @@ async function optionalAuth(req, res, next) {
   next();
 }
 
+// server/ranking.ts
+function timestampKey(value) {
+  if (value instanceof Date) return value.toISOString();
+  return String(value);
+}
+function rankKey(row) {
+  return `${Number(row.score) || 0}|${Number(row.clips) || 0}|${timestampKey(row.achieved_at)}`;
+}
+function toEntry(row, rank, viewerId) {
+  return {
+    rank,
+    playerId: row.player_id,
+    callsign: row.callsign || "Pilot",
+    score: Number(row.score) || 0,
+    clips: Number(row.clips) || 0,
+    skin: row.skin || "classic",
+    achievedAt: timestampKey(row.achieved_at),
+    isPlayer: Boolean(viewerId && row.player_id === viewerId)
+  };
+}
+function assignRanks(rows, viewerId) {
+  const entries = [];
+  let previousKey = null;
+  let currentRank = 0;
+  rows.forEach((row, index) => {
+    const key = rankKey(row);
+    if (key !== previousKey) {
+      currentRank = index + 1;
+      previousKey = key;
+    }
+    entries.push(toEntry(row, currentRank, viewerId));
+  });
+  return entries;
+}
+async function fetchAllTimeEntries(limit, viewerId) {
+  const rows = await sql`
+    SELECT
+      l.player_id,
+      l.callsign,
+      l.score,
+      l.clips,
+      COALESCE(l.skin, 'classic') AS skin,
+      to_char(l.achieved_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS achieved_at
+    FROM leaderboard l
+    ORDER BY l.score DESC, l.clips DESC, l.achieved_at ASC, l.player_id ASC
+    LIMIT ${limit}
+  `;
+  return assignRanks(rows, viewerId);
+}
+async function fetchDailyEntries(day, limit, viewerId) {
+  const rows = await sql`
+    SELECT
+      d.player_id,
+      p.callsign,
+      d.score,
+      d.clips,
+      COALESCE(d.skin, p.equipped_skin, 'classic') AS skin,
+      to_char(d.achieved_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS achieved_at
+    FROM daily_leaderboard d
+    JOIN players p ON p.id = d.player_id
+    WHERE d.day = ${day}::date
+      AND (p.firebase_uid IS NOT NULL OR p.email IS NOT NULL)
+    ORDER BY d.score DESC, d.clips DESC, d.achieved_at ASC, d.player_id ASC
+    LIMIT ${limit}
+  `;
+  return assignRanks(rows, viewerId);
+}
+async function fetchAllTimePlayerEntry(playerId) {
+  const rows = await sql`
+    WITH me AS (
+      SELECT
+        l.player_id,
+        l.callsign,
+        l.score,
+        l.clips,
+        COALESCE(l.skin, 'classic') AS skin,
+        to_char(l.achieved_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS achieved_at,
+        l.achieved_at AS sort_at
+      FROM leaderboard l
+      WHERE l.player_id = ${playerId}
+    )
+    SELECT
+      me.*,
+      (
+        SELECT COUNT(*)::int
+        FROM leaderboard b
+        WHERE b.score > me.score
+           OR (b.score = me.score AND b.clips > me.clips)
+           OR (b.score = me.score AND b.clips = me.clips AND b.achieved_at < me.sort_at)
+      ) + 1 AS rank
+    FROM me
+  `;
+  if (rows.length === 0) return null;
+  const row = rows[0];
+  const rank = Number(row.rank) || 1;
+  return {
+    entry: toEntry(row, rank, playerId),
+    rank
+  };
+}
+async function fetchDailyPlayerEntry(playerId, day) {
+  const rows = await sql`
+    WITH me AS (
+      SELECT
+        d.player_id,
+        p.callsign,
+        d.score,
+        d.clips,
+        COALESCE(d.skin, p.equipped_skin, 'classic') AS skin,
+        to_char(d.achieved_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS achieved_at,
+        d.achieved_at AS sort_at
+      FROM daily_leaderboard d
+      JOIN players p ON p.id = d.player_id
+      WHERE d.player_id = ${playerId}
+        AND d.day = ${day}::date
+        AND (p.firebase_uid IS NOT NULL OR p.email IS NOT NULL)
+    )
+    SELECT
+      me.*,
+      (
+        SELECT COUNT(*)::int
+        FROM daily_leaderboard b
+        WHERE b.day = ${day}::date
+          AND (
+            b.score > me.score
+            OR (b.score = me.score AND b.clips > me.clips)
+            OR (b.score = me.score AND b.clips = me.clips AND b.achieved_at < me.sort_at)
+          )
+      ) + 1 AS rank
+    FROM me
+  `;
+  if (rows.length === 0) return null;
+  const row = rows[0];
+  const rank = Number(row.rank) || 1;
+  return {
+    entry: toEntry(row, rank, playerId),
+    rank
+  };
+}
+var COUNT_CACHE_TTL_MS = 15e3;
+var COUNT_CACHE_MAX_ENTRIES = 256;
+var countCache = /* @__PURE__ */ new Map();
+async function cachedCount(key, load) {
+  const now = Date.now();
+  const cached = countCache.get(key);
+  if (cached && cached.expiresAt > now) return cached.count;
+  const count = await load();
+  if (countCache.size >= COUNT_CACHE_MAX_ENTRIES) {
+    for (const [entryKey, entry] of countCache) {
+      if (entry.expiresAt <= now) countCache.delete(entryKey);
+    }
+    while (countCache.size >= COUNT_CACHE_MAX_ENTRIES) {
+      const oldest = countCache.keys().next().value;
+      if (oldest === void 0) break;
+      countCache.delete(oldest);
+    }
+  }
+  countCache.set(key, { count, expiresAt: now + COUNT_CACHE_TTL_MS });
+  return count;
+}
+async function countAllTimePlayers() {
+  return cachedCount("all-time", async () => {
+    const rows = await sql`
+      SELECT COUNT(*)::int AS count
+      FROM leaderboard
+    `;
+    return Number(rows[0]?.count) || 0;
+  });
+}
+async function countDailyPlayers(day) {
+  return cachedCount(`daily:${day}`, async () => {
+    const rows = await sql`
+      SELECT COUNT(*)::int AS count
+      FROM daily_leaderboard
+      WHERE day = ${day}::date
+    `;
+    return Number(rows[0]?.count) || 0;
+  });
+}
+async function updateLeaderboardCallsign(playerId) {
+  await sql`
+    UPDATE leaderboard l
+    SET callsign = p.callsign
+    FROM players p
+    WHERE l.player_id = ${playerId}
+      AND p.id = l.player_id
+  `;
+}
+async function refreshPlayerLeaderboard(playerId) {
+  const playerRows = await sql`
+    SELECT callsign, firebase_uid, email
+    FROM players
+    WHERE id = ${playerId}
+  `;
+  const player = playerRows[0];
+  if (!player) return;
+  if (!player.firebase_uid && !player.email) {
+    await sql`DELETE FROM leaderboard WHERE player_id = ${playerId}`;
+    await sql`DELETE FROM daily_leaderboard WHERE player_id = ${playerId}`;
+    return;
+  }
+  await sql`
+    INSERT INTO leaderboard (player_id, callsign, score, clips, skin, flight_id, achieved_at)
+    SELECT
+      f.player_id,
+      p.callsign,
+      f.score,
+      COALESCE(f.clips_collected, 0),
+      f.skin_used,
+      f.id,
+      f.created_at
+    FROM flights f
+    JOIN players p ON p.id = f.player_id
+    WHERE f.player_id = ${playerId}
+      AND f.verified = true
+      AND f.verification_version >= 2
+      AND (p.firebase_uid IS NOT NULL OR p.email IS NOT NULL)
+    ORDER BY
+      f.score DESC,
+      COALESCE(f.clips_collected, 0) DESC,
+      f.created_at ASC,
+      f.id ASC
+    LIMIT 1
+    ON CONFLICT (player_id) DO UPDATE SET
+      callsign = EXCLUDED.callsign,
+      score = EXCLUDED.score,
+      clips = EXCLUDED.clips,
+      skin = EXCLUDED.skin,
+      flight_id = EXCLUDED.flight_id,
+      achieved_at = EXCLUDED.achieved_at
+    WHERE EXCLUDED.score > leaderboard.score
+       OR (EXCLUDED.score = leaderboard.score AND EXCLUDED.clips > leaderboard.clips)
+       OR (EXCLUDED.score = leaderboard.score
+           AND EXCLUDED.clips = leaderboard.clips
+           AND EXCLUDED.achieved_at < leaderboard.achieved_at)
+  `;
+  await sql`
+    INSERT INTO daily_leaderboard (day, player_id, score, clips, skin, flight_id, achieved_at)
+    SELECT
+      best.day,
+      best.player_id,
+      best.score,
+      best.clips,
+      best.skin,
+      best.flight_id,
+      best.achieved_at
+    FROM (
+      SELECT DISTINCT ON (day)
+        (f.created_at AT TIME ZONE 'UTC')::date AS day,
+        f.player_id,
+        f.score,
+        COALESCE(f.clips_collected, 0) AS clips,
+        f.skin_used AS skin,
+        f.id AS flight_id,
+        f.created_at AS achieved_at
+      FROM flights f
+      JOIN players p ON p.id = f.player_id
+      WHERE f.player_id = ${playerId}
+        AND f.verified = true
+        AND f.verification_version >= 2
+        AND (p.firebase_uid IS NOT NULL OR p.email IS NOT NULL)
+      ORDER BY
+        day,
+        f.score DESC,
+        COALESCE(f.clips_collected, 0) DESC,
+        f.created_at ASC,
+        f.id ASC
+    ) AS best
+    ON CONFLICT (day, player_id) DO UPDATE SET
+      score = EXCLUDED.score,
+      clips = EXCLUDED.clips,
+      skin = EXCLUDED.skin,
+      flight_id = EXCLUDED.flight_id,
+      achieved_at = EXCLUDED.achieved_at
+    WHERE EXCLUDED.score > daily_leaderboard.score
+       OR (EXCLUDED.score = daily_leaderboard.score AND EXCLUDED.clips > daily_leaderboard.clips)
+       OR (EXCLUDED.score = daily_leaderboard.score
+           AND EXCLUDED.clips = daily_leaderboard.clips
+           AND EXCLUDED.achieved_at < daily_leaderboard.achieved_at)
+  `;
+  await updateLeaderboardCallsign(playerId);
+}
+
+// server/routes/auth.ts
+var router = (0, import_express.Router)();
+var MAX_CODE_ATTEMPTS = 5;
+var PLAYER_COLUMNS = `
+  id, guest_token, callsign, equipped_skin, paperclips, unlocked_skins,
+  sound_enabled, firebase_uid, email, auth_provider
+`;
+function playerPayload(player) {
+  return {
+    id: player.id,
+    callsign: player.callsign,
+    equippedSkin: player.equipped_skin,
+    paperclips: player.paperclips,
+    unlockedSkins: player.unlocked_skins,
+    soundEnabled: player.sound_enabled,
+    email: player.email ?? null,
+    firebaseUid: player.firebase_uid ?? null,
+    isGuest: !player.firebase_uid && !player.email
+  };
+}
+function errorResponse(res, error2, fallback) {
+  if (error2 instanceof HttpError) {
+    res.status(error2.status).json({ error: error2.message });
+    return;
+  }
+  console.error(fallback, error2);
+  res.status(500).json({ error: fallback });
+}
+function normalizeEmail(value) {
+  if (typeof value !== "string") return null;
+  const email = value.trim().toLowerCase();
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) ? email : null;
+}
+router.post("/guest", rateLimit(30), async (req, res) => {
+  try {
+    const { callsign } = req.body || {};
+    const playerCallsign = callsign == null ? `Pilot${Math.floor(100 + Math.random() * 900)}` : callsignValue(callsign);
+    const guestToken = crypto9.randomUUID();
+    const rows = await sql`
+      INSERT INTO players (guest_token, callsign)
+      VALUES (${guestToken}, ${playerCallsign})
+      RETURNING ${sql.unsafe(PLAYER_COLUMNS)}
+    `;
+    res.status(201).json({
+      token: guestToken,
+      player: playerPayload(rows[0])
+    });
+  } catch (error2) {
+    errorResponse(res, error2, "Failed to create guest account");
+  }
+});
+router.post("/login", rateLimit(120), async (req, res) => {
+  try {
+    const { token } = req.body || {};
+    if (typeof token !== "string" || token.length < 8) {
+      res.status(400).json({ error: "Token is required" });
+      return;
+    }
+    const rows = await sql`
+      SELECT ${sql.unsafe(PLAYER_COLUMNS)}
+      FROM players
+      WHERE guest_token = ${token}
+    `;
+    if (rows.length === 0) {
+      res.status(401).json({ error: "Invalid token" });
+      return;
+    }
+    res.json({ player: playerPayload(rows[0]) });
+  } catch (error2) {
+    errorResponse(res, error2, "Failed to log in");
+  }
+});
+router.post("/sync-pilot", rateLimit(60), optionalAuth, async (req, res) => {
+  try {
+    const { firebaseUid, callsign, email, authProvider, idToken } = req.body || {};
+    const suppliedCallsign = callsign == null ? null : callsignValue(callsign);
+    const suppliedEmail = normalizeEmail(email);
+    let trustedUid = null;
+    let trustedEmail = null;
+    let provider = typeof authProvider === "string" ? authProvider.slice(0, 32) : "firebase";
+    if (idToken) {
+      const verified = await verifyFirebaseIdToken(idToken);
+      if (firebaseUid && String(firebaseUid) !== verified.uid) {
+        throw new HttpError(401, "Firebase session does not match this pilot.");
+      }
+      trustedUid = verified.uid;
+      trustedEmail = verified.emailVerified ? verified.email : null;
+      provider = verified.provider === "google" ? "google" : "firebase";
+    } else {
+      if (!suppliedEmail || !suppliedCallsign) {
+        throw new HttpError(403, "Verify your email address again to link this pilot.");
+      }
+      const proof = await sql`
+        SELECT id
+        FROM verification_codes
+        WHERE LOWER(email) = ${suppliedEmail}
+          AND LOWER(username) = LOWER(${suppliedCallsign ?? ""})
+          AND verified = true
+          AND created_at > NOW() - INTERVAL '30 minutes'
+        ORDER BY created_at DESC
+        LIMIT 1
+      `;
+      if (proof.length === 0) {
+        throw new HttpError(403, "Verify your email address again to link this pilot.");
+      }
+      trustedEmail = suppliedEmail;
+      provider = "otp";
+    }
+    let player = null;
+    if (trustedUid) {
+      const rows = await sql`
+        SELECT ${sql.unsafe(PLAYER_COLUMNS)}
+        FROM players
+        WHERE firebase_uid = ${trustedUid}
+        LIMIT 1
+      `;
+      player = rows[0] || null;
+    }
+    if (!player && trustedEmail) {
+      const rows = await sql`
+        SELECT ${sql.unsafe(PLAYER_COLUMNS)}
+        FROM players
+        WHERE LOWER(email) = ${trustedEmail}
+        LIMIT 1
+      `;
+      const emailPlayer = rows[0] || null;
+      if (emailPlayer?.firebase_uid && trustedUid && emailPlayer.firebase_uid !== trustedUid) {
+        throw new HttpError(409, "This email is already linked to a different sign-in method.");
+      }
+      player = emailPlayer;
+    }
+    if (!player && req.player && !req.player.firebaseUid && !req.player.email) {
+      const rows = await sql`
+        SELECT ${sql.unsafe(PLAYER_COLUMNS)}
+        FROM players
+        WHERE id = ${req.player.id}
+        LIMIT 1
+      `;
+      player = rows[0] || null;
+    }
+    if (player) {
+      if (player.firebase_uid && trustedUid && player.firebase_uid !== trustedUid) {
+        throw new HttpError(409, "This account is already linked to a different sign-in method.");
+      }
+      if (player.email && trustedEmail && String(player.email).toLowerCase() !== trustedEmail) {
+        throw new HttpError(409, "This account is already linked to a different email address.");
+      }
+      const isGuestUpgrade = !player.firebase_uid && !player.email;
+      const nextCallsign = isGuestUpgrade ? suppliedCallsign || player.callsign : player.callsign;
+      const rows = await sql`
+        UPDATE players
+        SET firebase_uid = COALESCE(firebase_uid, ${trustedUid}),
+            email = COALESCE(email, ${trustedEmail}),
+            callsign = ${nextCallsign},
+            auth_provider = CASE
+              WHEN auth_provider IS NULL OR auth_provider = 'guest' THEN ${provider}
+              ELSE auth_provider
+            END,
+            updated_at = NOW()
+        WHERE id = ${player.id}
+        RETURNING ${sql.unsafe(PLAYER_COLUMNS)}
+      `;
+      player = rows[0];
+    } else {
+      if (!suppliedCallsign) {
+        throw new HttpError(400, "A callsign is required to create a pilot account.");
+      }
+      const guestToken = crypto9.randomUUID();
+      const rows = await sql`
+        INSERT INTO players (guest_token, firebase_uid, callsign, email, auth_provider)
+        VALUES (${guestToken}, ${trustedUid}, ${suppliedCallsign}, ${trustedEmail}, ${provider})
+        RETURNING ${sql.unsafe(PLAYER_COLUMNS)}
+      `;
+      player = rows[0];
+    }
+    if (provider === "google" && trustedEmail && trustedUid) {
+      await sql`
+        INSERT INTO google_accounts (email, firebase_uid, callsign, updated_at)
+        VALUES (${trustedEmail}, ${trustedUid}, ${player.callsign}, NOW())
+        ON CONFLICT (email) DO UPDATE
+        SET firebase_uid = EXCLUDED.firebase_uid,
+            callsign = EXCLUDED.callsign,
+            updated_at = NOW()
+      `;
+    }
+    await refreshPlayerLeaderboard(player.id).catch((error2) => {
+      console.error("Leaderboard refresh after pilot sync failed:", error2);
+    });
+    res.json({ token: player.guest_token, player: playerPayload(player) });
+  } catch (error2) {
+    if (error2?.code === "23505") {
+      res.status(409).json({ error: "This email or sign-in method is already linked to another pilot." });
+      return;
+    }
+    errorResponse(res, error2, "Failed to sync pilot account");
+  }
+});
+router.get("/check-google", rateLimit(120), async (req, res) => {
+  try {
+    const email = req.query.email?.trim().toLowerCase();
+    const identifier = req.query.identifier?.trim().toLowerCase();
+    const queryVal = email || identifier;
+    if (!queryVal) {
+      res.json({ isGoogle: false });
+      return;
+    }
+    const googleRows = queryVal.includes("@") ? await sql`SELECT email FROM google_accounts WHERE LOWER(email) = ${queryVal} LIMIT 1` : await sql`SELECT email FROM google_accounts WHERE LOWER(callsign) = ${queryVal} LIMIT 1`;
+    if (googleRows.length > 0) {
+      res.json({ isGoogle: true, message: "This account is registered with Google. Try signing in with Google." });
+      return;
+    }
+    const playerRows = queryVal.includes("@") ? await sql`
+          SELECT id FROM players
+          WHERE LOWER(email) = ${queryVal} AND auth_provider = 'google'
+          LIMIT 1
+        ` : await sql`
+          SELECT id FROM players
+          WHERE LOWER(callsign) = ${queryVal} AND auth_provider = 'google'
+          LIMIT 1
+        `;
+    res.json(playerRows.length > 0 ? { isGoogle: true, message: "This account is registered with Google. Try signing in with Google." } : { isGoogle: false });
+  } catch (err) {
+    console.error("Check google error:", err);
+    res.json({ isGoogle: false });
+  }
+});
+router.post("/send-verification-code", rateLimit(10), optionalAuth, async (req, res) => {
+  try {
+    const { email, username, type = "signup" } = req.body || {};
+    const trimmedEmail = normalizeEmail(email);
+    if (!trimmedEmail) {
+      res.status(400).json({ error: "Please enter a valid email address." });
+      return;
+    }
+    const cleanUsername = typeof username === "string" ? username.trim() : "";
+    if (cleanUsername.length < 3 || cleanUsername.length > 20) {
+      res.status(400).json({ error: "Username must be between 3 and 20 characters long." });
+      return;
+    }
+    if (!/^[a-zA-Z0-9_-]+$/.test(cleanUsername)) {
+      res.status(400).json({ error: "Username can only contain letters, numbers, underscores, and dashes." });
+      return;
+    }
+    const verificationType = type === "login" ? "login" : "signup";
+    const googleCheck = await sql`
+      SELECT email FROM google_accounts
+      WHERE LOWER(email) = ${trimmedEmail}
+         OR LOWER(callsign) = LOWER(${cleanUsername})
+      LIMIT 1
+    `;
+    if (googleCheck.length > 0) {
+      res.status(400).json({
+        error: "This account is registered with Google. Try signing in with Google.",
+        isGoogle: true
+      });
+      return;
+    }
+    const playerGoogleCheck = await sql`
+      SELECT id FROM players
+      WHERE (LOWER(email) = ${trimmedEmail} OR LOWER(callsign) = LOWER(${cleanUsername}))
+        AND auth_provider = 'google'
+      LIMIT 1
+    `;
+    if (playerGoogleCheck.length > 0) {
+      res.status(400).json({
+        error: "This account is registered with Google. Try signing in with Google.",
+        isGoogle: true
+      });
+      return;
+    }
+    if (verificationType === "signup") {
+      const existing = await sql`
+        SELECT id, email, firebase_uid
+        FROM players
+        WHERE LOWER(callsign) = LOWER(${cleanUsername})
+           OR LOWER(email) = ${trimmedEmail}
+        LIMIT 1
+      `;
+      const isCurrentGuest = Boolean(
+        existing[0] && req.player && existing[0].id === req.player.id && !existing[0].email && !existing[0].firebase_uid
+      );
+      if (existing.length > 0 && !isCurrentGuest) {
+        res.status(400).json({ error: "This username or email is already registered. Try logging in." });
+        return;
+      }
+    }
+    const recent = await sql`
+      SELECT id
+      FROM verification_codes
+      WHERE LOWER(email) = ${trimmedEmail}
+        AND verified = false
+        AND created_at > NOW() - INTERVAL '60 seconds'
+      LIMIT 1
+    `;
+    if (recent.length > 0) {
+      res.status(429).json({ error: "Please wait a minute before requesting another code." });
+      return;
+    }
+    const code = crypto9.randomInt(1e5, 1e6).toString();
+    await sql`
+      DELETE FROM verification_codes
+      WHERE LOWER(email) = ${trimmedEmail} AND verified = false
+    `;
+    await sql`
+      INSERT INTO verification_codes (email, username, code, type, expires_at)
+      VALUES (${trimmedEmail}, ${cleanUsername}, ${code}, ${verificationType}, NOW() + INTERVAL '10 minutes')
+    `;
+    await sendVerificationEmail({
+      email: trimmedEmail,
+      username: cleanUsername,
+      code,
+      type: verificationType
+    });
+    res.json({
+      success: true,
+      message: "Verification code sent to your email address. Please check your inbox and Spam folder.",
+      email: trimmedEmail,
+      username: cleanUsername
+    });
+  } catch (error2) {
+    errorResponse(res, error2, "Failed to send verification code. Please try again.");
+  }
+});
+router.post("/verify-code", rateLimit(20), optionalAuth, async (req, res) => {
+  try {
+    const { email, code } = req.body || {};
+    const trimmedEmail = normalizeEmail(email);
+    const trimmedCode = typeof code === "string" || typeof code === "number" ? String(code).trim() : "";
+    if (!trimmedEmail || !/^\d{6}$/.test(trimmedCode)) {
+      res.status(400).json({ error: "A valid email and 6-digit verification code are required." });
+      return;
+    }
+    const codeRows = await sql`
+      SELECT id, email, username, code, type, attempts, expires_at
+      FROM verification_codes
+      WHERE LOWER(email) = ${trimmedEmail}
+        AND verified = false
+      ORDER BY created_at DESC
+      LIMIT 1
+    `;
+    const record = codeRows[0];
+    if (!record || new Date(record.expires_at).getTime() <= Date.now()) {
+      res.status(400).json({
+        error: "Invalid or expired verification code. Please check your Gmail (including Spam folder) and try again."
+      });
+      return;
+    }
+    if (Number(record.attempts) >= MAX_CODE_ATTEMPTS) {
+      res.status(429).json({ error: "Too many incorrect attempts. Request a new verification code." });
+      return;
+    }
+    if (String(record.code) !== trimmedCode) {
+      await sql`
+        UPDATE verification_codes
+        SET attempts = COALESCE(attempts, 0) + 1
+        WHERE id = ${record.id}
+      `;
+      res.status(400).json({
+        error: "Invalid or expired verification code. Please check your Gmail (including Spam folder) and try again."
+      });
+      return;
+    }
+    const verificationType = record.type || "signup";
+    const finalCallsign = callsignValue(record.username);
+    const marked = await sql`
+      UPDATE verification_codes
+      SET verified = true
+      WHERE id = ${record.id}
+        AND verified = false
+        AND COALESCE(attempts, 0) < ${MAX_CODE_ATTEMPTS}
+      RETURNING id
+    `;
+    if (marked.length === 0) {
+      res.status(400).json({ error: "This verification code has already been used." });
+      return;
+    }
+    let playerRows = await sql`
+      SELECT ${sql.unsafe(PLAYER_COLUMNS)}
+      FROM players
+      WHERE LOWER(email) = ${trimmedEmail}
+      LIMIT 1
+    `;
+    if (playerRows.length === 0 && verificationType === "signup" && req.player && !req.player.firebaseUid && !req.player.email) {
+      const upgraded = await sql`
+        UPDATE players
+        SET email = ${trimmedEmail},
+            callsign = ${finalCallsign},
+            auth_provider = CASE
+              WHEN auth_provider IS NULL OR auth_provider = 'guest' THEN 'otp'
+              ELSE auth_provider
+            END,
+            updated_at = NOW()
+        WHERE id = ${req.player.id}
+          AND email IS NULL
+          AND firebase_uid IS NULL
+        RETURNING ${sql.unsafe(PLAYER_COLUMNS)}
+      `;
+      playerRows = upgraded;
+    }
+    if (playerRows.length === 0 && verificationType === "login") {
+      const priorProof = await sql`
+        SELECT id FROM verification_codes
+        WHERE LOWER(username) = LOWER(${finalCallsign})
+          AND LOWER(email) = ${trimmedEmail}
+          AND verified = true
+          AND id <> ${record.id}
+        LIMIT 1
+      `;
+      if (priorProof.length > 0) {
+        const candidates = await sql`
+          SELECT ${sql.unsafe(PLAYER_COLUMNS)}
+          FROM players
+          WHERE LOWER(callsign) = LOWER(${finalCallsign})
+            AND email IS NULL
+            AND firebase_uid IS NULL
+          ORDER BY created_at ASC
+          LIMIT 1
+        `;
+        playerRows = candidates;
+      }
+    }
+    let player;
+    if (playerRows.length > 0) {
+      player = playerRows[0];
+      if (player.email && String(player.email).toLowerCase() !== trimmedEmail) {
+        res.status(409).json({ error: "This callsign is linked to a different email address." });
+        return;
+      }
+      const updated = await sql`
+        UPDATE players
+        SET email = COALESCE(email, ${trimmedEmail}),
+            auth_provider = CASE
+              WHEN auth_provider IS NULL OR auth_provider = 'guest' THEN 'otp'
+              ELSE auth_provider
+            END,
+            updated_at = NOW()
+        WHERE id = ${player.id}
+        RETURNING ${sql.unsafe(PLAYER_COLUMNS)}
+      `;
+      player = updated[0];
+    } else {
+      if (verificationType === "login") {
+        res.status(404).json({ error: "No pilot account is linked to this email address." });
+        return;
+      }
+      const guestToken = crypto9.randomUUID();
+      try {
+        const inserted = await sql`
+          INSERT INTO players (guest_token, callsign, email, auth_provider)
+          VALUES (${guestToken}, ${finalCallsign}, ${trimmedEmail}, 'otp')
+          RETURNING ${sql.unsafe(PLAYER_COLUMNS)}
+        `;
+        player = inserted[0];
+      } catch (insertError) {
+        if (insertError?.code !== "23505") throw insertError;
+        const existing = await sql`
+          SELECT ${sql.unsafe(PLAYER_COLUMNS)}
+          FROM players
+          WHERE LOWER(email) = ${trimmedEmail}
+          LIMIT 1
+        `;
+        if (!existing[0]) throw insertError;
+        player = existing[0];
+      }
+    }
+    await refreshPlayerLeaderboard(player.id).catch((error2) => {
+      console.error("Leaderboard refresh after email verification failed:", error2);
+    });
+    res.json({
+      success: true,
+      token: player.guest_token,
+      player: playerPayload(player)
+    });
+  } catch (error2) {
+    if (error2?.code === "23505") {
+      res.status(409).json({ error: "This username or email is already registered. Try logging in." });
+      return;
+    }
+    errorResponse(res, error2, "Failed to verify code. Please try again.");
+  }
+});
+router.delete("/account", rateLimit(10), authMiddleware, async (req, res) => {
+  try {
+    const playerId = req.player.id;
+    const deleted = await sql`
+      DELETE FROM players
+      WHERE id = ${playerId}
+      RETURNING id, callsign, firebase_uid, email
+    `;
+    if (deleted.length === 0) {
+      res.status(404).json({ error: "Pilot account not found." });
+      return;
+    }
+    const account = deleted[0];
+    if (account.firebase_uid) {
+      await sql`DELETE FROM google_accounts WHERE firebase_uid = ${account.firebase_uid}`;
+    }
+    if (account.email) {
+      await sql`DELETE FROM google_accounts WHERE LOWER(email) = LOWER(${account.email})`;
+      await sql`DELETE FROM verification_codes WHERE LOWER(email) = LOWER(${account.email})`;
+    }
+    res.json({
+      success: true,
+      deletedCount: 1,
+      message: "Pilot account and all associated records permanently removed from Neon DB."
+    });
+  } catch (error2) {
+    errorResponse(res, error2, "Failed to delete account from Neon DB");
+  }
+});
+var auth_default = router;
+
+// server/routes/leaderboard.ts
+var import_express2 = __toESM(require_express2(), 1);
+
+// server/time.ts
+function utcDayString(date = /* @__PURE__ */ new Date()) {
+  return date.toISOString().slice(0, 10);
+}
+
 // server/routes/leaderboard.ts
 var router2 = (0, import_express2.Router)();
+function limitValue(raw) {
+  const parsed = Number(Array.isArray(raw) ? raw[0] : raw);
+  if (!Number.isFinite(parsed)) return 100;
+  return Math.min(Math.max(Math.trunc(parsed), 1), 500);
+}
+function dayValue(raw) {
+  if (raw == null || raw === "") return utcDayString();
+  const value = typeof raw === "string" ? raw.trim() : "";
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return null;
+  const parsed = /* @__PURE__ */ new Date(`${value}T00:00:00.000Z`);
+  if (Number.isNaN(parsed.getTime()) || utcDayString(parsed) !== value) return null;
+  return value;
+}
 router2.get("/", optionalAuth, async (req, res) => {
   try {
-    const limit = Math.min(Math.max(parseInt(req.query.limit) || 100, 1), 500);
-    const rows = await sql`
-      SELECT l.id, l.player_id, l.callsign, l.score, l.clips, l.skin, l.achieved_at
-      FROM leaderboard l
-      JOIN players p ON l.player_id = p.id
-      WHERE p.firebase_uid IS NOT NULL
-      ORDER BY l.score DESC, l.clips DESC, l.achieved_at ASC
-      LIMIT ${limit}
-    `;
-    const entries = rows.map((row, index) => ({
-      rank: index + 1,
-      playerId: row.player_id,
-      callsign: row.callsign,
-      score: row.score,
-      clips: row.clips,
-      skin: row.skin,
-      achievedAt: row.achieved_at,
-      isPlayer: req.player ? row.player_id === req.player.id : false
-    }));
-    res.json({ entries });
+    const limit = limitValue(req.query.limit);
+    const viewerId = req.player?.id ?? null;
+    const [entries, player, totalPlayers] = await Promise.all([
+      fetchAllTimeEntries(limit, viewerId),
+      viewerId ? fetchAllTimePlayerEntry(viewerId) : Promise.resolve(null),
+      countAllTimePlayers()
+    ]);
+    res.set("Cache-Control", "no-store");
+    res.json({
+      entries,
+      playerEntry: player?.entry ?? null,
+      playerRank: player?.rank ?? null,
+      totalPlayers,
+      date: utcDayString()
+    });
   } catch (error2) {
     console.error("Leaderboard error:", error2);
     res.status(500).json({ error: "Failed to fetch leaderboard" });
@@ -42497,27 +43042,26 @@ router2.get("/", optionalAuth, async (req, res) => {
 });
 router2.get("/daily", optionalAuth, async (req, res) => {
   try {
-    const limit = Math.min(Math.max(parseInt(req.query.limit) || 100, 1), 500);
-    const rows = await sql`
-      SELECT l.id, l.player_id, l.callsign, l.score, l.clips, l.skin, l.achieved_at
-      FROM leaderboard l
-      JOIN players p ON l.player_id = p.id
-      WHERE p.firebase_uid IS NOT NULL
-        AND l.achieved_at >= CURRENT_DATE
-      ORDER BY l.score DESC, l.clips DESC, l.achieved_at ASC
-      LIMIT ${limit}
-    `;
-    const entries = rows.map((row, index) => ({
-      rank: index + 1,
-      playerId: row.player_id,
-      callsign: row.callsign,
-      score: row.score,
-      clips: row.clips,
-      skin: row.skin,
-      achievedAt: row.achieved_at,
-      isPlayer: req.player ? row.player_id === req.player.id : false
-    }));
-    res.json({ entries });
+    const limit = limitValue(req.query.limit);
+    const day = dayValue(req.query.date);
+    if (!day) {
+      res.status(400).json({ error: "date must be a real calendar day in YYYY-MM-DD format." });
+      return;
+    }
+    const viewerId = req.player?.id ?? null;
+    const [entries, player, totalPlayers] = await Promise.all([
+      fetchDailyEntries(day, limit, viewerId),
+      viewerId ? fetchDailyPlayerEntry(viewerId, day) : Promise.resolve(null),
+      countDailyPlayers(day)
+    ]);
+    res.set("Cache-Control", "no-store");
+    res.json({
+      entries,
+      playerEntry: player?.entry ?? null,
+      playerRank: player?.rank ?? null,
+      totalPlayers,
+      date: day
+    });
   } catch (error2) {
     console.error("Daily leaderboard error:", error2);
     res.status(500).json({ error: "Failed to fetch daily leaderboard" });
@@ -42683,6 +43227,74 @@ function createBarrierPool(size = 8) {
 var FIXED_DT = 1 / 60;
 
 // src/game/rules.ts
+var DEFAULT_SKINS = [
+  {
+    id: "classic",
+    name: "Origami Standard",
+    description: "Clean folded bond paper. Balanced and reliable.",
+    primaryColor: "#ffffff",
+    foldColor: "#e2e8f0",
+    accentColor: "#3b82f6",
+    lineStyle: "plain",
+    unlockedByDefault: true,
+    costInClips: 0
+  },
+  {
+    id: "graph",
+    name: "Quad Grapher",
+    description: "Folded from an engineer\u2019s 5mm math grid notebook.",
+    primaryColor: "#f8fafc",
+    foldColor: "#cbd5e1",
+    accentColor: "#0ea5e9",
+    lineStyle: "grid",
+    unlockedByDefault: false,
+    costInClips: 15
+  },
+  {
+    id: "postit",
+    name: "Neon Post-It",
+    description: "Vibrant sticky-note fold that catches schoolroom drafts.",
+    primaryColor: "#fef08a",
+    foldColor: "#fde047",
+    accentColor: "#eab308",
+    lineStyle: "postit",
+    unlockedByDefault: false,
+    costInClips: 25
+  },
+  {
+    id: "blueprint",
+    name: "Aero Blueprint",
+    description: "Cyanotype paper with precision drafting schematics.",
+    primaryColor: "#1e3a8a",
+    foldColor: "#172554",
+    accentColor: "#93c5fd",
+    lineStyle: "blueprint",
+    unlockedByDefault: false,
+    costInClips: 40
+  },
+  {
+    id: "airmail",
+    name: "Airmail Express",
+    description: "Classic red & blue chevron border airmail stationery.",
+    primaryColor: "#fffbeb",
+    foldColor: "#fef3c7",
+    accentColor: "#ef4444",
+    lineStyle: "creased",
+    unlockedByDefault: false,
+    costInClips: 60
+  },
+  {
+    id: "gold",
+    name: "Golden Parchment",
+    description: "Lustrous foil origami reserved for sketchbook masters.",
+    primaryColor: "#fbbf24",
+    foldColor: "#d97706",
+    accentColor: "#fef08a",
+    lineStyle: "gold",
+    unlockedByDefault: false,
+    costInClips: 100
+  }
+];
 var GLIDER_STATS = {
   classic: {
     gravity: 920,
@@ -43043,6 +43655,7 @@ function getPowerUpPhysicsModifiers(activePowerUps) {
 }
 
 // src/game/simulation.ts
+var SIMULATION_VERSION = "1";
 var MAX_FLIGHT_FRAMES = 60 * 60 * 10;
 function spawnBarrier(state, x2) {
   const h2 = state.worldHeight || 600;
@@ -43211,243 +43824,418 @@ function stepFlightSimulation(state, flap) {
 // server/replay.ts
 function verifyReplay(seed, inputs, claimedScore, skinId = "classic", worldWidth = 800, worldHeight = 600) {
   const sim = createFlightSimulation(seed, skinId, worldWidth, worldHeight);
-  const sortedInputs = [...inputs].sort((a2, b2) => a2.frame - b2.frame);
+  const sortedInputs = inputs.map((input, index) => ({ input, index })).sort((a2, b2) => a2.input.frame - b2.input.frame || a2.index - b2.index).map(({ input }) => input);
   let inputIndex = 0;
-  const maxFrame = sortedInputs.length > 0 ? sortedInputs[sortedInputs.length - 1].frame + 120 : 600;
-  while (sim.plane.isAlive && sim.frameCount <= maxFrame && sim.frameCount < 60 * 60 * 10) {
+  while (sim.plane.isAlive && sim.frameCount < MAX_FLIGHT_FRAMES) {
     let flap = false;
     while (inputIndex < sortedInputs.length && sortedInputs[inputIndex].frame === sim.frameCount) {
-      if (sortedInputs[inputIndex].action === "flap") {
+      const input = sortedInputs[inputIndex];
+      if (input.action === "resize") {
+        if (Number.isFinite(input.width) && Number.isFinite(input.height)) {
+          sim.worldWidth = input.width;
+          sim.worldHeight = input.height;
+        }
+      } else {
         flap = true;
       }
       inputIndex++;
     }
     const events = stepFlightSimulation(sim, flap);
-    if (events.crashed) {
-      break;
-    }
+    if (events.crashed) break;
   }
-  const valid = Math.abs(sim.score - claimedScore) <= 1;
-  return { valid, replayScore: sim.score };
+  const valid = sim.score === claimedScore;
+  return {
+    valid,
+    replayScore: sim.score,
+    replayClips: sim.clipsCollected,
+    frames: sim.frameCount
+  };
 }
 
 // server/routes/flights.ts
 var router3 = (0, import_express3.Router)();
-router3.post("/start", authMiddleware, async (req, res) => {
+var MAX_SCORE = 1e6;
+var MAX_CLIPS = 5e4;
+var MAX_INPUTS = 1e4;
+var MIN_WORLD = 200;
+var MAX_WORLD = 5e3;
+var SKIN_IDS = new Set(DEFAULT_SKINS.map((skin) => skin.id));
+function integerValue(value, min, max, label) {
+  const parsed = typeof value === "number" ? value : Number(value);
+  if (!Number.isInteger(parsed) || parsed < min || parsed > max) {
+    throw new HttpError(400, `${label} must be an integer between ${min} and ${max}.`);
+  }
+  return parsed;
+}
+function seedValue(value) {
+  if (typeof value !== "string" || !/^[A-Za-z0-9_-]{6,64}$/.test(value)) {
+    throw new HttpError(400, "Invalid flight seed.");
+  }
+  return value;
+}
+function worldValue(value, fallback, label) {
+  if (value == null) return fallback;
+  return integerValue(value, MIN_WORLD, MAX_WORLD, label);
+}
+function skinValue(value, player) {
+  const unlocked = Array.isArray(player?.unlockedSkins) ? player.unlockedSkins : [];
+  const requested = typeof value === "string" && value.length > 0 ? value : player?.equippedSkin || "classic";
+  if (!SKIN_IDS.has(requested)) throw new HttpError(400, "Unknown glider skin.");
+  if (!unlocked.includes(requested)) throw new HttpError(403, "This glider skin is not unlocked.");
+  return requested;
+}
+function parseInputs(value) {
+  if (!Array.isArray(value)) throw new HttpError(400, "inputs must be an array.");
+  if (value.length > MAX_INPUTS) throw new HttpError(400, "Too many replay inputs.");
+  return value.map((raw) => {
+    if (!raw || typeof raw !== "object") throw new HttpError(400, "Invalid replay input.");
+    const entry = raw;
+    const frame = integerValue(entry.frame, 0, MAX_FLIGHT_FRAMES - 1, "Input frame");
+    if (entry.action === "flap") return { frame, action: "flap" };
+    if (entry.action === "resize") {
+      return {
+        frame,
+        action: "resize",
+        width: integerValue(entry.width, MIN_WORLD, MAX_WORLD, "Input width"),
+        height: integerValue(entry.height, MIN_WORLD, MAX_WORLD, "Input height")
+      };
+    }
+    throw new HttpError(400, "Invalid replay input action.");
+  });
+}
+function isRankedPilot(player) {
+  return Boolean(player.firebaseUid || player.email);
+}
+async function applyVerifiedFlight(player, achievedAt, clips) {
+  const day = utcDayString(achievedAt);
+  const ranked = isRankedPilot(player);
+  const statements = [
+    sql`
+      UPDATE players
+      SET paperclips = COALESCE(paperclips, 0) + ${clips}, updated_at = NOW()
+      WHERE id = ${player.id}
+      RETURNING paperclips
+    `
+  ];
+  if (ranked) {
+    statements.push(
+      // Derive the row from every verified flight instead of only the one just
+      // submitted. This is self-healing: if a sign-in ever failed to refresh
+      // this pilot's historical best, the next submission restores it rather
+      // than ranking the pilot on a lower score. The unique index guarantees
+      // one row per pilot and the WHERE clause means a slower concurrent
+      // request can never replace a better flight.
+      sql`
+        INSERT INTO leaderboard (player_id, callsign, score, clips, skin, flight_id, achieved_at)
+        SELECT
+          f.player_id,
+          p.callsign,
+          f.score,
+          COALESCE(f.clips_collected, 0),
+          f.skin_used,
+          f.id,
+          f.created_at
+        FROM flights f
+        JOIN players p ON p.id = f.player_id
+        WHERE f.player_id = ${player.id}
+          AND f.verified = true
+          AND f.verification_version >= 2
+        ORDER BY
+          f.score DESC,
+          COALESCE(f.clips_collected, 0) DESC,
+          f.created_at ASC,
+          f.id ASC
+        LIMIT 1
+        ON CONFLICT (player_id) DO UPDATE SET
+          callsign = EXCLUDED.callsign,
+          score = EXCLUDED.score,
+          clips = EXCLUDED.clips,
+          skin = EXCLUDED.skin,
+          flight_id = EXCLUDED.flight_id,
+          achieved_at = EXCLUDED.achieved_at
+        WHERE EXCLUDED.score > leaderboard.score
+           OR (EXCLUDED.score = leaderboard.score AND EXCLUDED.clips > leaderboard.clips)
+           OR (EXCLUDED.score = leaderboard.score
+               AND EXCLUDED.clips = leaderboard.clips
+               AND EXCLUDED.achieved_at < leaderboard.achieved_at)
+      `,
+      // Renames are independent of score improvements, so the display name is
+      // applied unconditionally (a no-op when the upsert already wrote it).
+      sql`
+        UPDATE leaderboard l
+        SET callsign = p.callsign
+        FROM players p
+        WHERE l.player_id = ${player.id}
+          AND p.id = l.player_id
+      `,
+      sql`
+        INSERT INTO daily_leaderboard (day, player_id, score, clips, skin, flight_id, achieved_at)
+        SELECT
+          (f.created_at AT TIME ZONE 'UTC')::date,
+          f.player_id,
+          f.score,
+          COALESCE(f.clips_collected, 0),
+          f.skin_used,
+          f.id,
+          f.created_at
+        FROM flights f
+        WHERE f.player_id = ${player.id}
+          AND f.verified = true
+          AND f.verification_version >= 2
+          AND (f.created_at AT TIME ZONE 'UTC')::date = ${day}::date
+        ORDER BY
+          f.score DESC,
+          COALESCE(f.clips_collected, 0) DESC,
+          f.created_at ASC,
+          f.id ASC
+        LIMIT 1
+        ON CONFLICT (day, player_id) DO UPDATE SET
+          score = EXCLUDED.score,
+          clips = EXCLUDED.clips,
+          skin = EXCLUDED.skin,
+          flight_id = EXCLUDED.flight_id,
+          achieved_at = EXCLUDED.achieved_at
+        WHERE EXCLUDED.score > daily_leaderboard.score
+           OR (EXCLUDED.score = daily_leaderboard.score AND EXCLUDED.clips > daily_leaderboard.clips)
+           OR (EXCLUDED.score = daily_leaderboard.score
+               AND EXCLUDED.clips = daily_leaderboard.clips
+               AND EXCLUDED.achieved_at < daily_leaderboard.achieved_at)
+      `
+    );
+  }
+  const results = await sql.transaction(statements);
+  const paperclips = Number(results[0][0]?.paperclips) || 0;
+  if (!ranked) {
+    return { rank: null, dailyRank: null, day, paperclips };
+  }
+  const [allTime, daily] = await Promise.all([
+    fetchAllTimePlayerEntry(player.id),
+    fetchDailyPlayerEntry(player.id, day)
+  ]);
+  return {
+    rank: allTime?.rank ?? null,
+    dailyRank: daily?.rank ?? null,
+    day,
+    paperclips
+  };
+}
+router3.post("/start", rateLimit(600), authMiddleware, async (req, res) => {
   try {
     const player = req.player;
-    const seed = req.body?.seed && typeof req.body.seed === "string" && req.body.seed.length > 5 ? req.body.seed : crypto10.randomUUID();
-    const skinUsed = req.body?.skinUsed || player.equippedSkin || "classic";
+    const seed = seedValue(req.body?.seed ?? crypto10.randomUUID());
+    const skin = skinValue(req.body?.skinUsed, player);
+    const worldWidth = worldValue(req.body?.worldWidth, 800, "worldWidth");
+    const worldHeight = worldValue(req.body?.worldHeight, 600, "worldHeight");
     const rows = await sql`
-      INSERT INTO flights (player_id, seed, skin_used)
-      VALUES (${player.id}, ${seed}, ${skinUsed})
+      INSERT INTO flights (player_id, seed, skin_used, world_width, world_height, verification_version)
+      VALUES (${player.id}, ${seed}, ${skin}, ${worldWidth}, ${worldHeight}, 2)
+      ON CONFLICT (player_id, seed) DO UPDATE SET
+        skin_used = EXCLUDED.skin_used,
+        world_width = EXCLUDED.world_width,
+        world_height = EXCLUDED.world_height,
+        verification_version = 2
+      WHERE flights.submitted_at IS NULL
+        AND flights.verified = false
+        AND flights.score = 0
       RETURNING id
     `;
-    const flight = rows[0];
+    if (rows.length === 0) {
+      throw new HttpError(409, "This flight has already been submitted.");
+    }
     res.status(201).json({
-      sessionId: flight.id,
-      seed
+      sessionId: rows[0].id,
+      seed,
+      skinId: skin,
+      simulationVersion: SIMULATION_VERSION,
+      worldWidth,
+      worldHeight,
+      expiresAt: new Date(Date.now() + 60 * 60 * 1e3).toISOString()
     });
   } catch (error2) {
+    if (error2 instanceof HttpError) {
+      res.status(error2.status).json({ error: error2.message });
+      return;
+    }
     console.error("Flight start error:", error2);
     res.status(500).json({ error: "Failed to start flight" });
   }
 });
-router3.post("/:id/submit", authMiddleware, async (req, res) => {
+router3.post("/:id/submit", rateLimit(600), authMiddleware, async (req, res) => {
   try {
     const player = req.player;
-    const flightId = req.params.id;
-    const { score, clipsCollected, inputs, durationMs, worldWidth, worldHeight } = req.body;
-    if (score == null || !Array.isArray(inputs)) {
-      res.status(400).json({ error: "Missing required fields: score, inputs" });
-      return;
-    }
+    const flightId = uuidValue(req.params.id);
+    const { score, clipsCollected, inputs, durationMs } = req.body || {};
+    const claimedScore = integerValue(score, 0, MAX_SCORE, "score");
+    integerValue(clipsCollected ?? 0, 0, MAX_CLIPS, "clipsCollected");
+    const parsedInputs = parseInputs(inputs);
+    const duration = durationMs == null ? null : integerValue(durationMs, 0, MAX_FLIGHT_FRAMES * 1e3, "durationMs");
     const flightRows = await sql`
-      SELECT id, player_id, seed, score, verified
+      SELECT id, player_id, seed, score, submitted_at, skin_used, world_width, world_height, created_at
       FROM flights
       WHERE id = ${flightId}
     `;
-    if (flightRows.length === 0) {
-      res.status(404).json({ error: "Flight not found" });
-      return;
-    }
     const flight = flightRows[0];
-    if (flight.player_id !== player.id) {
-      res.status(403).json({ error: "Flight does not belong to this player" });
-      return;
+    if (!flight) throw new HttpError(404, "Flight not found.");
+    if (flight.player_id !== player.id) throw new HttpError(403, "This flight belongs to another pilot.");
+    if (flight.submitted_at !== null || flight.verified || flight.score !== 0) {
+      throw new HttpError(409, "This flight has already been submitted.");
     }
-    if (flight.score !== 0 || flight.verified) {
-      res.status(409).json({ error: "Flight already submitted" });
-      return;
-    }
-    const replayResult = verifyReplay(
-      flight.seed,
-      inputs,
-      score,
-      flight.skin_used || "classic",
-      Number(worldWidth) || 800,
-      Number(worldHeight) || 600
+    const worldWidth = worldValue(
+      flight.world_width ?? req.body?.worldWidth,
+      800,
+      "worldWidth"
     );
-    if (!replayResult.valid) {
-      await sql`
-        UPDATE flights
-        SET score = ${score}, input_log = ${JSON.stringify(inputs)},
-            duration_ms = ${durationMs || 0}, verified = false
-        WHERE id = ${flightId}
+    const worldHeight = worldValue(
+      flight.world_height ?? req.body?.worldHeight,
+      600,
+      "worldHeight"
+    );
+    const skin = skinValue(flight.skin_used ?? req.body?.skinUsed, player);
+    const replay = verifyReplay(
+      flight.seed,
+      parsedInputs,
+      claimedScore,
+      skin,
+      worldWidth,
+      worldHeight
+    );
+    const updated = await sql`
+      UPDATE flights
+      SET score = ${replay.replayScore},
+          clips_collected = ${replay.replayClips},
+          input_log = ${JSON.stringify(parsedInputs)},
+          duration_ms = ${duration},
+          verified = ${replay.valid},
+          world_width = ${worldWidth},
+          world_height = ${worldHeight},
+          verification_version = 2,
+          submitted_at = NOW()
+      WHERE id = ${flightId}
+        AND player_id = ${player.id}
+        AND submitted_at IS NULL
+      RETURNING id, created_at
+    `;
+    if (updated.length === 0) throw new HttpError(409, "This flight has already been submitted.");
+    if (!replay.valid) {
+      const current = await sql`
+        SELECT paperclips FROM players WHERE id = ${player.id}
       `;
       res.json({
         verified: false,
-        score: replayResult.replayScore,
+        score: replay.replayScore,
+        clipsCollected: replay.replayClips,
+        paperclips: Number(current[0]?.paperclips) || 0,
+        rank: null,
+        dailyRank: null,
+        isGuest: !isRankedPilot(player),
+        date: utcDayString(new Date(flight.created_at)),
         message: "Score verification failed"
       });
       return;
     }
-    const verifiedScore = replayResult.replayScore;
-    const clipsCount = clipsCollected || 0;
-    await sql`
-      UPDATE flights
-      SET score = ${verifiedScore}, clips_collected = ${clipsCount},
-          input_log = ${JSON.stringify(inputs)}, duration_ms = ${durationMs || 0},
-          verified = true
-      WHERE id = ${flightId}
-    `;
-    await sql`
-      UPDATE players
-      SET paperclips = paperclips + ${clipsCount}, updated_at = NOW()
-      WHERE id = ${player.id}
-    `;
-    const isPlayerSignedIn = !player.isGuest && Boolean(player.firebaseUid);
-    if (!isPlayerSignedIn) {
-      res.json({
-        verified: true,
-        score: verifiedScore,
-        rank: null,
-        isGuest: true,
-        message: "Flight recorded! Sign in to join the official Global Leaderboard."
-      });
-      return;
-    }
-    const existingLb = await sql`
-      SELECT id, score, clips FROM leaderboard
-      WHERE player_id = ${player.id}
-    `;
-    if (existingLb.length === 0) {
-      await sql`
-        INSERT INTO leaderboard (player_id, callsign, score, clips, skin, flight_id)
-        VALUES (${player.id}, ${player.callsign}, ${verifiedScore}, ${clipsCount}, ${player.equippedSkin}, ${flightId})
-      `;
-    } else if (verifiedScore > existingLb[0].score || verifiedScore === existingLb[0].score && clipsCount > (existingLb[0].clips || 0)) {
-      await sql`
-        UPDATE leaderboard
-        SET score = ${verifiedScore}, clips = GREATEST(clips, ${clipsCount}), skin = ${player.equippedSkin},
-            flight_id = ${flightId}, callsign = ${player.callsign}, achieved_at = NOW()
-        WHERE player_id = ${player.id}
-      `;
-    }
-    const rankRows = await sql`
-      SELECT COUNT(*) + 1 AS rank
-      FROM leaderboard l
-      JOIN players p ON l.player_id = p.id
-      WHERE p.firebase_uid IS NOT NULL
-        AND l.score > (
-          SELECT COALESCE(MAX(score), 0) FROM leaderboard WHERE player_id = ${player.id}
-        )
-    `;
-    const rank = parseInt(rankRows[0].rank);
+    const achievedAt = new Date(updated[0].created_at);
+    const applied = await applyVerifiedFlight(player, achievedAt, replay.replayClips);
     res.json({
       verified: true,
-      score: verifiedScore,
-      rank,
-      isGuest: false
+      score: replay.replayScore,
+      clipsCollected: replay.replayClips,
+      rank: applied.rank,
+      dailyRank: applied.dailyRank,
+      paperclips: applied.paperclips,
+      isGuest: !isRankedPilot(player),
+      date: applied.day,
+      message: isRankedPilot(player) ? void 0 : "Flight recorded! Sign in to join the official Global Leaderboard."
     });
   } catch (error2) {
+    if (error2 instanceof HttpError) {
+      res.status(error2.status).json({ error: error2.message });
+      return;
+    }
     console.error("Flight submit error:", error2);
     res.status(500).json({ error: "Failed to submit flight" });
   }
 });
-router3.post("/direct-submit", authMiddleware, async (req, res) => {
+router3.post("/direct-submit", rateLimit(600), authMiddleware, async (req, res) => {
   try {
     const player = req.player;
-    const { seed, score, clipsCollected, inputs, durationMs, skinUsed, worldWidth, worldHeight } = req.body;
-    if (score == null || !Array.isArray(inputs) || !seed) {
-      res.status(400).json({ error: "Missing required fields: seed, score, inputs" });
-      return;
-    }
-    const actualSkin = skinUsed || player.equippedSkin || "classic";
-    const replayResult = verifyReplay(
-      seed,
-      inputs,
-      score,
-      actualSkin,
-      Number(worldWidth) || 800,
-      Number(worldHeight) || 600
-    );
-    const clipsCount = clipsCollected || 0;
+    const { seed, score, clipsCollected, inputs, durationMs, skinUsed, worldWidth, worldHeight } = req.body || {};
+    const flightSeed = seedValue(seed);
+    const claimedScore = integerValue(score, 0, MAX_SCORE, "score");
+    integerValue(clipsCollected ?? 0, 0, MAX_CLIPS, "clipsCollected");
+    const parsedInputs = parseInputs(inputs);
+    const duration = durationMs == null ? null : integerValue(durationMs, 0, MAX_FLIGHT_FRAMES * 1e3, "durationMs");
+    const skin = skinValue(skinUsed, player);
+    const width = worldValue(worldWidth, 800, "worldWidth");
+    const height = worldValue(worldHeight, 600, "worldHeight");
+    const replay = verifyReplay(flightSeed, parsedInputs, claimedScore, skin, width, height);
     const flightRows = await sql`
-      INSERT INTO flights (player_id, seed, score, clips_collected, skin_used, input_log, verified, duration_ms)
-      VALUES (${player.id}, ${seed}, ${replayResult.replayScore}, ${clipsCount}, ${actualSkin}, ${JSON.stringify(inputs)}, ${replayResult.valid}, ${durationMs || 0})
-      RETURNING id
+      INSERT INTO flights (
+        player_id, seed, score, clips_collected, skin_used, input_log,
+        verified, duration_ms, world_width, world_height, verification_version, submitted_at
+      )
+      VALUES (
+        ${player.id}, ${flightSeed}, ${replay.replayScore}, ${replay.replayClips},
+        ${skin}, ${JSON.stringify(parsedInputs)}, ${replay.valid}, ${duration},
+        ${width}, ${height}, 2, NOW()
+      )
+      ON CONFLICT (player_id, seed) DO UPDATE SET
+        score = EXCLUDED.score,
+        clips_collected = EXCLUDED.clips_collected,
+        skin_used = EXCLUDED.skin_used,
+        input_log = EXCLUDED.input_log,
+        verified = EXCLUDED.verified,
+        duration_ms = EXCLUDED.duration_ms,
+        world_width = EXCLUDED.world_width,
+        world_height = EXCLUDED.world_height,
+        verification_version = 2,
+        submitted_at = NOW()
+      WHERE flights.submitted_at IS NULL
+        AND flights.verified = false
+        AND flights.score = 0
+      RETURNING id, created_at
     `;
-    const flightId = flightRows[0].id;
-    if (!replayResult.valid) {
+    if (flightRows.length === 0) {
+      throw new HttpError(409, "This flight has already been submitted.");
+    }
+    const flight = flightRows[0];
+    if (!replay.valid) {
+      const current = await sql`
+        SELECT paperclips FROM players WHERE id = ${player.id}
+      `;
       res.json({
         verified: false,
-        score: replayResult.replayScore,
+        score: replay.replayScore,
+        clipsCollected: replay.replayClips,
+        paperclips: Number(current[0]?.paperclips) || 0,
+        rank: null,
+        dailyRank: null,
+        isGuest: !isRankedPilot(player),
+        date: utcDayString(new Date(flight.created_at)),
         message: "Score verification failed"
       });
       return;
     }
-    const verifiedScore = replayResult.replayScore;
-    await sql`
-      UPDATE players
-      SET paperclips = paperclips + ${clipsCount}, updated_at = NOW()
-      WHERE id = ${player.id}
-    `;
-    const isPlayerSignedIn = !player.isGuest && Boolean(player.firebaseUid);
-    if (!isPlayerSignedIn) {
-      res.json({
-        verified: true,
-        score: verifiedScore,
-        rank: null,
-        isGuest: true,
-        message: "Flight recorded! Sign in to join the official Global Leaderboard."
-      });
-      return;
-    }
-    const existingLb = await sql`
-      SELECT id, score, clips FROM leaderboard
-      WHERE player_id = ${player.id}
-    `;
-    if (existingLb.length === 0) {
-      await sql`
-        INSERT INTO leaderboard (player_id, callsign, score, clips, skin, flight_id)
-        VALUES (${player.id}, ${player.callsign}, ${verifiedScore}, ${clipsCount}, ${actualSkin}, ${flightId})
-      `;
-    } else if (verifiedScore > existingLb[0].score || verifiedScore === existingLb[0].score && clipsCount > (existingLb[0].clips || 0)) {
-      await sql`
-        UPDATE leaderboard
-        SET score = ${verifiedScore}, clips = GREATEST(clips, ${clipsCount}), skin = ${actualSkin},
-            flight_id = ${flightId}, callsign = ${player.callsign}, achieved_at = NOW()
-        WHERE player_id = ${player.id}
-      `;
-    }
-    const rankRows = await sql`
-      SELECT COUNT(*) + 1 AS rank
-      FROM leaderboard l
-      JOIN players p ON l.player_id = p.id
-      WHERE p.firebase_uid IS NOT NULL
-        AND l.score > (
-          SELECT COALESCE(MAX(score), 0) FROM leaderboard WHERE player_id = ${player.id}
-        )
-    `;
-    const rank = parseInt(rankRows[0].rank);
+    const applied = await applyVerifiedFlight(
+      player,
+      new Date(flight.created_at),
+      replay.replayClips
+    );
     res.json({
       verified: true,
-      score: verifiedScore,
-      rank,
-      isGuest: false
+      score: replay.replayScore,
+      clipsCollected: replay.replayClips,
+      rank: applied.rank,
+      dailyRank: applied.dailyRank,
+      paperclips: applied.paperclips,
+      isGuest: !isRankedPilot(player),
+      date: applied.day,
+      message: isRankedPilot(player) ? void 0 : "Flight recorded! Sign in to join the official Global Leaderboard."
     });
   } catch (error2) {
+    if (error2 instanceof HttpError) {
+      res.status(error2.status).json({ error: error2.message });
+      return;
+    }
     console.error("Direct flight submit error:", error2);
     res.status(500).json({ error: "Failed to submit flight directly" });
   }
@@ -43471,64 +44259,108 @@ function generateDailyChallenges(dateStr) {
     {
       id: `pass_pencils_${dateStr}`,
       type: "pass_pencils",
-      description: `Pass ${passTarget} pencils in a single flight`,
+      title: "Pencil Dodger",
+      description: `Glide through ${passTarget} pencil barriers in a single flight.`,
       target: passTarget,
       reward: 10
     },
     {
       id: `collect_clips_${dateStr}`,
       type: "collect_clips",
-      description: `Collect ${clipTarget} paperclips in a single flight`,
+      title: "Stationery Scavenger",
+      description: `Collect ${clipTarget} golden paperclips today.`,
       target: clipTarget,
       reward: 15
     },
     {
       id: `reach_score_${dateStr}`,
       type: "reach_score",
-      description: `Reach a score of ${scoreTarget}`,
+      title: "Master Aeronaut",
+      description: `Reach a flight score of ${scoreTarget} points.`,
       target: scoreTarget,
       reward: 25
     }
   ];
 }
-function getTodayDateStr() {
-  return (/* @__PURE__ */ new Date()).toISOString().split("T")[0];
+async function fetchMetrics(playerId, day) {
+  const rows = await sql`
+    SELECT
+      COALESCE(MAX(score), 0)::int AS best_score,
+      COALESCE(SUM(clips_collected), 0)::int AS total_clips
+    FROM flights
+    WHERE player_id = ${playerId}
+      AND verified = true
+      AND verification_version >= 2
+      AND (created_at AT TIME ZONE 'UTC')::date = ${day}::date
+  `;
+  return {
+    bestScore: Number(rows[0]?.best_score) || 0,
+    totalClips: Number(rows[0]?.total_clips) || 0
+  };
+}
+function currentCountFor(challenge, metrics) {
+  if (challenge.type === "collect_clips") return metrics.totalClips;
+  return metrics.bestScore;
+}
+function toResponse(challenge, progress) {
+  return {
+    id: challenge.id,
+    type: challenge.type,
+    title: challenge.title,
+    description: challenge.description,
+    target: challenge.target,
+    targetCount: challenge.target,
+    reward: challenge.reward,
+    rewardClips: challenge.reward,
+    currentCount: progress.currentCount,
+    completed: progress.completed,
+    claimed: progress.claimed
+  };
+}
+async function syncProgress(playerId, challenges, day, metrics) {
+  const result = [];
+  for (const challenge of challenges) {
+    const currentCount = currentCountFor(challenge, metrics);
+    const completed = currentCount >= challenge.target;
+    const rows = await sql`
+      INSERT INTO daily_challenge_progress (
+        player_id, challenge_date, challenge_id, current_count, completed
+      )
+      VALUES (${playerId}, ${day}::date, ${challenge.id}, ${currentCount}, ${completed})
+      ON CONFLICT (player_id, challenge_id) DO UPDATE SET
+        challenge_date = EXCLUDED.challenge_date,
+        current_count = EXCLUDED.current_count,
+        completed = EXCLUDED.completed OR daily_challenge_progress.claimed
+      RETURNING current_count, completed, claimed
+    `;
+    const row = rows[0];
+    result.push({
+      id: challenge.id,
+      currentCount: Number(row?.current_count) || 0,
+      completed: Boolean(row?.completed),
+      claimed: Boolean(row?.claimed)
+    });
+  }
+  return result;
 }
 router4.get("/daily", authMiddleware, async (req, res) => {
   try {
     const player = req.player;
-    const dateStr = getTodayDateStr();
-    const challenges = generateDailyChallenges(dateStr);
-    const challengeIds = challenges.map((c) => c.id);
-    const progressRows = await sql`
-      SELECT challenge_id, current_count, completed, claimed
-      FROM daily_challenge_progress
-      WHERE player_id = ${player.id}
-        AND challenge_date = CURRENT_DATE
-        AND challenge_id = ANY(${challengeIds})
-    `;
-    const progressMap = /* @__PURE__ */ new Map();
-    for (const row of progressRows) {
-      progressMap.set(row.challenge_id, {
-        currentCount: row.current_count,
-        completed: row.completed,
-        claimed: row.claimed
-      });
-    }
-    const result = challenges.map((c) => {
-      const progress = progressMap.get(c.id);
-      return {
-        id: c.id,
-        type: c.type,
-        description: c.description,
-        target: c.target,
-        reward: c.reward,
-        currentCount: progress?.currentCount ?? 0,
-        completed: progress?.completed ?? false,
-        claimed: progress?.claimed ?? false
-      };
+    const day = utcDayString();
+    const definitions = generateDailyChallenges(day);
+    const metrics = await fetchMetrics(player.id, day);
+    const progress = await syncProgress(player.id, definitions, day, metrics);
+    const byId = new Map(progress.map((entry) => [entry.id, entry]));
+    res.json({
+      date: day,
+      challenges: definitions.map(
+        (challenge) => toResponse(challenge, byId.get(challenge.id) ?? {
+          currentCount: 0,
+          completed: false,
+          claimed: false
+        })
+      )
     });
-    res.json({ date: dateStr, challenges: result });
   } catch (error2) {
     console.error("Daily challenges error:", error2);
     res.status(500).json({ error: "Failed to fetch daily challenges" });
@@ -43538,48 +44370,51 @@ router4.post("/:id/claim", authMiddleware, async (req, res) => {
   try {
     const player = req.player;
     const challengeId = req.params.id;
-    const dateStr = getTodayDateStr();
-    const challenges = generateDailyChallenges(dateStr);
-    const challenge = challenges.find((c) => c.id === challengeId);
+    const day = utcDayString();
+    const definitions = generateDailyChallenges(day);
+    const challenge = definitions.find((entry) => entry.id === challengeId);
     if (!challenge) {
       res.status(404).json({ error: "Challenge not found" });
       return;
     }
-    const progressRows = await sql`
-      SELECT id, completed, claimed
-      FROM daily_challenge_progress
-      WHERE player_id = ${player.id}
-        AND challenge_id = ${challengeId}
-        AND challenge_date = CURRENT_DATE
-    `;
-    if (progressRows.length === 0) {
-      res.status(400).json({ error: "No progress found for this challenge" });
-      return;
-    }
-    const progress = progressRows[0];
-    if (!progress.completed) {
+    const metrics = await fetchMetrics(player.id, day);
+    const currentCount = currentCountFor(challenge, metrics);
+    const completed = currentCount >= challenge.target;
+    await syncProgress(player.id, definitions, day, metrics);
+    if (!completed) {
       res.status(400).json({ error: "Challenge not yet completed" });
       return;
     }
-    if (progress.claimed) {
+    const claimed = await sql`
+      WITH claimed AS (
+        UPDATE daily_challenge_progress
+        SET claimed = true
+        WHERE player_id = ${player.id}
+          AND challenge_id = ${challengeId}
+          AND completed = true
+          AND claimed = false
+        RETURNING id
+      ), rewarded AS (
+        UPDATE players
+        SET paperclips = COALESCE(paperclips, 0) + ${challenge.reward},
+            updated_at = NOW()
+        WHERE id = ${player.id}
+          AND EXISTS (SELECT 1 FROM claimed)
+        RETURNING paperclips
+      )
+      SELECT
+        (SELECT COUNT(*)::int FROM claimed) AS claimed_count,
+        (SELECT paperclips FROM rewarded) AS paperclips
+    `;
+    if (Number(claimed[0]?.claimed_count) !== 1) {
       res.status(409).json({ error: "Reward already claimed" });
       return;
     }
-    await sql`
-      UPDATE daily_challenge_progress
-      SET claimed = true
-      WHERE id = ${progress.id}
-    `;
-    const updatedPlayer = await sql`
-      UPDATE players
-      SET paperclips = paperclips + ${challenge.reward}, updated_at = NOW()
-      WHERE id = ${player.id}
-      RETURNING paperclips
-    `;
     res.json({
+      success: true,
       claimed: true,
       reward: challenge.reward,
-      paperclips: updatedPlayer[0].paperclips
+      paperclips: Number(claimed[0]?.paperclips) || 0
     });
   } catch (error2) {
     console.error("Claim challenge error:", error2);
@@ -43591,45 +44426,61 @@ var challenges_default = router4;
 // server/routes/inventory.ts
 var import_express5 = __toESM(require_express2(), 1);
 var router5 = (0, import_express5.Router)();
+var SKINS_BY_ID = new Map(DEFAULT_SKINS.map((skin) => [skin.id, skin]));
+function unlockedSkins(player) {
+  return Array.isArray(player?.unlockedSkins) ? player.unlockedSkins : ["classic"];
+}
+function playerPayload2(updated) {
+  return {
+    id: updated.id,
+    callsign: updated.callsign,
+    equippedSkin: updated.equipped_skin,
+    paperclips: updated.paperclips,
+    unlockedSkins: updated.unlocked_skins,
+    soundEnabled: updated.sound_enabled
+  };
+}
 router5.post("/unlock", authMiddleware, async (req, res) => {
   try {
     const player = req.player;
-    const { skinId, cost } = req.body;
-    if (!skinId || cost == null) {
-      res.status(400).json({ error: "Missing required fields: skinId, cost" });
+    const { skinId } = req.body || {};
+    if (typeof skinId !== "string") {
+      res.status(400).json({ error: "Missing required field: skinId" });
       return;
     }
-    if (typeof cost !== "number" || cost < 0) {
-      res.status(400).json({ error: "Invalid cost" });
+    const skin = SKINS_BY_ID.get(skinId);
+    if (!skin) {
+      res.status(400).json({ error: "Unknown glider skin" });
       return;
     }
-    if (player.paperclips < cost) {
-      res.status(400).json({ error: "Not enough paperclips" });
-      return;
-    }
-    if (player.unlockedSkins.includes(skinId)) {
+    if (skin.unlockedByDefault || unlockedSkins(player).includes(skinId)) {
       res.status(409).json({ error: "Skin already unlocked" });
       return;
     }
-    const updatedRows = await sql`
+    const rows = await sql`
       UPDATE players
-      SET paperclips = paperclips - ${cost},
-          unlocked_skins = array_append(unlocked_skins, ${skinId}),
+      SET paperclips = COALESCE(paperclips, 0) - ${skin.costInClips},
+          unlocked_skins = array_append(
+            COALESCE(unlocked_skins, ARRAY['classic']::text[]),
+            ${skinId}
+          ),
+          equipped_skin = ${skinId},
           updated_at = NOW()
       WHERE id = ${player.id}
+        AND COALESCE(paperclips, 0) >= ${skin.costInClips}
+        AND NOT (${skinId} = ANY(COALESCE(unlocked_skins, ARRAY['classic']::text[])))
       RETURNING id, callsign, equipped_skin, paperclips, unlocked_skins, sound_enabled
     `;
-    const updated = updatedRows[0];
-    res.json({
-      player: {
-        id: updated.id,
-        callsign: updated.callsign,
-        equippedSkin: updated.equipped_skin,
-        paperclips: updated.paperclips,
-        unlockedSkins: updated.unlocked_skins,
-        soundEnabled: updated.sound_enabled
+    if (rows.length === 0) {
+      const current = await sql`SELECT paperclips FROM players WHERE id = ${player.id}`;
+      if (Number(current[0]?.paperclips) < skin.costInClips) {
+        res.status(400).json({ error: "Not enough paperclips" });
+      } else {
+        res.status(409).json({ error: "Skin already unlocked" });
       }
-    });
+      return;
+    }
+    res.json({ player: playerPayload2(rows[0]) });
   } catch (error2) {
     console.error("Unlock skin error:", error2);
     res.status(500).json({ error: "Failed to unlock skin" });
@@ -43638,12 +44489,12 @@ router5.post("/unlock", authMiddleware, async (req, res) => {
 router5.patch("/equip", authMiddleware, async (req, res) => {
   try {
     const player = req.player;
-    const { skinId } = req.body;
-    if (!skinId) {
-      res.status(400).json({ error: "Missing required field: skinId" });
+    const { skinId } = req.body || {};
+    if (typeof skinId !== "string" || !SKINS_BY_ID.has(skinId)) {
+      res.status(400).json({ error: "Unknown glider skin" });
       return;
     }
-    if (!player.unlockedSkins.includes(skinId)) {
+    if (!unlockedSkins(player).includes(skinId)) {
       res.status(400).json({ error: "Skin not unlocked" });
       return;
     }
@@ -43651,19 +44502,14 @@ router5.patch("/equip", authMiddleware, async (req, res) => {
       UPDATE players
       SET equipped_skin = ${skinId}, updated_at = NOW()
       WHERE id = ${player.id}
+        AND ${skinId} = ANY(COALESCE(unlocked_skins, ARRAY['classic']::text[]))
       RETURNING id, callsign, equipped_skin, paperclips, unlocked_skins, sound_enabled
     `;
-    const updated = updatedRows[0];
-    res.json({
-      player: {
-        id: updated.id,
-        callsign: updated.callsign,
-        equippedSkin: updated.equipped_skin,
-        paperclips: updated.paperclips,
-        unlockedSkins: updated.unlocked_skins,
-        soundEnabled: updated.sound_enabled
-      }
-    });
+    if (updatedRows.length === 0) {
+      res.status(409).json({ error: "Skin is not available on this account" });
+      return;
+    }
+    res.json({ player: playerPayload2(updatedRows[0]) });
   } catch (error2) {
     console.error("Equip skin error:", error2);
     res.status(500).json({ error: "Failed to equip skin" });
@@ -43672,49 +44518,44 @@ router5.patch("/equip", authMiddleware, async (req, res) => {
 router5.patch("/settings", authMiddleware, async (req, res) => {
   try {
     const player = req.player;
-    const { callsign, soundEnabled } = req.body;
-    const updates = {};
-    if (callsign !== void 0) updates.callsign = callsign;
-    if (soundEnabled !== void 0) updates.soundEnabled = soundEnabled;
-    if (Object.keys(updates).length === 0) {
+    const { callsign, soundEnabled } = req.body || {};
+    if (callsign === void 0 && soundEnabled === void 0) {
       res.status(400).json({ error: "No settings to update" });
       return;
     }
-    let updatedRows;
-    if (callsign !== void 0 && soundEnabled !== void 0) {
-      updatedRows = await sql`
-        UPDATE players
-        SET callsign = ${callsign}, sound_enabled = ${soundEnabled}, updated_at = NOW()
-        WHERE id = ${player.id}
-        RETURNING id, callsign, equipped_skin, paperclips, unlocked_skins, sound_enabled
-      `;
-    } else if (callsign !== void 0) {
-      updatedRows = await sql`
-        UPDATE players
-        SET callsign = ${callsign}, updated_at = NOW()
-        WHERE id = ${player.id}
-        RETURNING id, callsign, equipped_skin, paperclips, unlocked_skins, sound_enabled
-      `;
-    } else {
-      updatedRows = await sql`
-        UPDATE players
-        SET sound_enabled = ${soundEnabled}, updated_at = NOW()
-        WHERE id = ${player.id}
-        RETURNING id, callsign, equipped_skin, paperclips, unlocked_skins, sound_enabled
-      `;
+    if (soundEnabled !== void 0 && typeof soundEnabled !== "boolean") {
+      res.status(400).json({ error: "soundEnabled must be a boolean" });
+      return;
     }
+    const cleanCallsign = callsign === void 0 ? null : callsignValue(callsign);
+    const updatedRows = await sql`
+      UPDATE players
+      SET callsign = COALESCE(${cleanCallsign}, callsign),
+          sound_enabled = COALESCE(${soundEnabled ?? null}::boolean, sound_enabled),
+          updated_at = NOW()
+      WHERE id = ${player.id}
+      RETURNING id, callsign, equipped_skin, paperclips, unlocked_skins, sound_enabled
+    `;
     const updated = updatedRows[0];
-    res.json({
-      player: {
-        id: updated.id,
-        callsign: updated.callsign,
-        equippedSkin: updated.equipped_skin,
-        paperclips: updated.paperclips,
-        unlockedSkins: updated.unlocked_skins,
-        soundEnabled: updated.sound_enabled
+    if (cleanCallsign) {
+      await updateLeaderboardCallsign(player.id);
+      if (player.firebaseUid || player.email) {
+        await sql`
+          UPDATE google_accounts
+          SET callsign = ${cleanCallsign}, updated_at = NOW()
+          WHERE (${player.firebaseUid ?? null}::text IS NOT NULL
+                 AND firebase_uid = ${player.firebaseUid ?? null})
+             OR (${player.email ?? null}::text IS NOT NULL
+                 AND LOWER(email) = LOWER(${player.email ?? null}::text))
+        `;
       }
-    });
+    }
+    res.json({ player: playerPayload2(updated) });
   } catch (error2) {
+    if (error2?.status === 400) {
+      res.status(400).json({ error: error2.message });
+      return;
+    }
     console.error("Update settings error:", error2);
     res.status(500).json({ error: "Failed to update settings" });
   }
@@ -43723,8 +44564,10 @@ var inventory_default = router5;
 
 // server/app.ts
 var app = (0, import_express6.default)();
+app.set("trust proxy", 1);
+app.disable("x-powered-by");
 app.use((0, import_cors.default)());
-app.use(import_express6.default.json());
+app.use(import_express6.default.json({ limit: "1mb" }));
 app.use((req, _res, next) => {
   if (req.originalUrl && req.originalUrl !== req.url) {
     req.url = req.originalUrl;
@@ -43755,13 +44598,14 @@ app.use(["/api/leaderboard", "/leaderboard"], leaderboard_default);
 app.use(["/api/flights", "/flights"], flights_default);
 app.use(["/api/challenges", "/challenges"], challenges_default);
 app.use(["/api/inventory", "/inventory"], inventory_default);
-app.use((err, _req, res, _next) => {
-  console.error("[API Error]:", err);
-  res.status(err?.status || 500).json({
-    status: "error",
-    error: err?.message || "Internal Server Error"
-  });
+app.use((req, res, next) => {
+  if (req.path === "/api" || req.path.startsWith("/api/")) {
+    res.status(404).json({ error: "Not found" });
+    return;
+  }
+  next();
 });
+app.use(errorHandler);
 
 // server/api.ts
 function handler(req, res) {
