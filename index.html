@@ -25,26 +25,6 @@
   <body class="bg-[#f7f4ea] text-[#2c2b28] select-none touch-none overflow-hidden overscroll-none" data-state="title">
     <div id="root"></div>
     <script type="module" src="/src/main.tsx"></script>
-    <script>
-      // Clear legacy service worker caches on localhost to ensure instant live updates
-      if ('serviceWorker' in navigator) {
-        if (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1') {
-          navigator.serviceWorker.getRegistrations().then((registrations) => {
-            for (const r of registrations) {
-              r.unregister();
-            }
-          });
-          if ('caches' in window) {
-            caches.keys().then((keys) => {
-              for (const k of keys) caches.delete(k);
-            });
-          }
-        } else {
-          window.addEventListener('load', () => {
-            navigator.serviceWorker.register('/sw.js').catch(() => {});
-          });
-        }
-      }
-    </script>
+    <script src="/register-sw.js" defer></script>
   </body>
 </html>

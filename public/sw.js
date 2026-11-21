@@ -1,6 +1,6 @@
 /// <reference lib="webworker" />
 
-const CACHE_NAME = 'paper-glider-v2';
+const CACHE_NAME = 'paper-glider-v3';
 
 self.addEventListener('install', () => {
   self.skipWaiting();

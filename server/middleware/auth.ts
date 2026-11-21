@@ -1,5 +1,6 @@
 import { Request, Response, NextFunction } from 'express';
 import { sql } from '../db.js';
+import { clearSessionCookie, readSessionToken } from '../session.js';
 
 export interface AuthenticatedRequest extends Request {
   player?: {
@@ -21,14 +22,12 @@ export async function authMiddleware(
   res: Response,
   next: NextFunction
 ): Promise<void> {
-  const authHeader = req.headers.authorization;
+  const token = readSessionToken(req);
 
-  if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    res.status(401).json({ error: 'Missing or invalid authorization header' });
+  if (!token) {
+    res.status(401).json({ error: 'Missing or invalid session' });
     return;
   }
-
-  const token = authHeader.slice(7);
 
   try {
     const rows = await sql`
@@ -38,7 +37,8 @@ export async function authMiddleware(
     `;
 
     if (rows.length === 0) {
-      res.status(401).json({ error: 'Invalid token' });
+      clearSessionCookie(req, res);
+      res.status(401).json({ error: 'Invalid session' });
       return;
     }
 
@@ -68,14 +68,12 @@ export async function optionalAuth(
   res: Response,
   next: NextFunction
 ): Promise<void> {
-  const authHeader = req.headers.authorization;
+  const token = readSessionToken(req);
 
-  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+  if (!token) {
     next();
     return;
   }
-
-  const token = authHeader.slice(7);
 
   try {
     const rows = await sql`
@@ -98,6 +96,8 @@ export async function optionalAuth(
         authProvider: player.auth_provider || 'guest',
         isGuest: !player.firebase_uid && !player.email,
       };
+    } else {
+      clearSessionCookie(req, res);
     }
   } catch (error) {
     console.error('Optional auth middleware error:', error);

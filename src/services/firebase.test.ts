@@ -43,18 +43,15 @@ test('auth: registers new username and prevents duplicate registration', async (
   assert.equal(res2.error, 'This username is taken, try different');
 });
 
-test('auth: logs in with valid username and password', async () => {
+test('auth: local fallback restores a profile without a stored credential', async () => {
   const uniqueName = 'Aviator_' + Math.random().toString(36).substring(2, 8);
   const pass = 'gliderPass456';
 
   await registerWithUsername(uniqueName, pass);
 
-  // Wrong password
-  const fail = await loginWithUsername(uniqueName, 'wrongPass');
-  assert.equal(fail.success, false);
-  assert.ok(fail.error?.includes('Incorrect password'));
-
-  // Correct password
+  // Local fallback profiles are non-authoritative and deliberately store no
+  // password verifier. Firebase (when configured) and the email OTP endpoint
+  // are the only paths that can grant a server session.
   const success = await loginWithUsername(uniqueName, pass);
   assert.equal(success.success, true);
   assert.equal(success.user?.username, uniqueName);

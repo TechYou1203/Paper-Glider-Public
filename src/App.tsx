@@ -55,6 +55,7 @@ import {
   isServerOnline,
   loginWithToken,
   loginWithTokenDetailed,
+  logoutServerSession,
   onServerStatusChange,
   reconnectServer,
   reconnectServerWithDetails,
@@ -1147,11 +1148,14 @@ export default function App() {
     }
   };
 
-  const handleContinueAsGuest = () => {
+  const handleContinueAsGuest = async () => {
+    // Rotate and expire the previous pilot's server session before creating a
+    // fresh guest, otherwise the old HttpOnly cookie could outlive the UI
+    // logout and submit flights for the wrong pilot.
+    await logoutServerSession();
+    await logoutUser();
     writeLocalString(GUEST_FLAG_KEY, 'true');
     removeLocalString('paper_glider_user_stats');
-    // Do not let the previous pilot's bearer token submit this guest's flights.
-    clearToken();
     // Guest starts with clean stats (progress is not persisted locally).
     const fresh = getInitialUserStats();
     setUserStats(fresh);
@@ -1159,7 +1163,7 @@ export default function App() {
     setScore(0);
     setFlightClips(0);
     setShowAuthModal(false);
-    void startFreshGuestSession(fresh.callsign);
+    await startFreshGuestSession(fresh.callsign);
   };
 
   const handleReconnect = useCallback(async (): Promise<{ success: boolean; message: string }> => {
@@ -1202,9 +1206,11 @@ export default function App() {
   }, [currentUser, userStats.callsign]);
 
   const handleLogout = async () => {
+    await logoutServerSession();
     await logoutUser();
-    // Firebase sign-out does not revoke the Neon bearer token. Clear it so the
-    // next guest cannot be ranked as, or submit flights for, the old pilot.
+    // Firebase sign-out does not revoke the Neon session. The server rotates
+    // and expires the HttpOnly cookie; clear any in-memory legacy token too so
+    // the next guest cannot be ranked as, or submit flights for, the old pilot.
     clearToken();
     setCurrentUser(null);
     writeLocalString(GUEST_FLAG_KEY, 'true');
@@ -1243,7 +1249,7 @@ export default function App() {
         setShowAccountModal(false);
         writeLocalString(GUEST_FLAG_KEY, 'true');
         removeLocalString('paper_glider_user_stats');
-        removeLocalString('paper_glider_auth_token');
+        clearToken();
         const fresh = getInitialUserStats();
         setUserStats(fresh);
         setHighScore(0);

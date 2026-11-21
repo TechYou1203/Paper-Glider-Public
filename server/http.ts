@@ -1,8 +1,65 @@
 import type { ErrorRequestHandler, RequestHandler, Request, Response, NextFunction } from 'express';
+import { isSecureRequest } from './session.js';
 
 export class HttpError extends Error {
   constructor(public status: number, message: string) { super(message); }
 }
+
+/**
+ * MTA-STS policy served from /.well-known/mta-sts.txt. Keep this in sync with
+ * public/.well-known/mta-sts.txt (Vercel serves the static copy; Express serves
+ * this route when it owns the frontend).
+ *
+ * Start in testing mode so a mismatch can be observed before enforcing. Once
+ * the DNS TXT record and MX entries are correct, switch to mode: enforce.
+ */
+export const MTA_STS_POLICY = 'version: STSv1\nmode: testing\nmax_age: 86400\n';
+
+const CONTENT_SECURITY_POLICY = [
+  "default-src 'self'",
+  "base-uri 'self'",
+  "object-src 'none'",
+  "frame-ancestors 'none'",
+  "form-action 'self'",
+  "script-src 'self' https://apis.google.com https://www.google.com https://www.gstatic.com",
+  "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
+  "font-src 'self' data: https://fonts.gstatic.com",
+  "img-src 'self' data: blob: https://*.googleusercontent.com https://*.gstatic.com https://www.google.com",
+  "connect-src 'self' https://*.googleapis.com https://*.firebaseio.com https://*.firebaseapp.com https://*.google.com",
+  "frame-src 'self' https://accounts.google.com https://*.firebaseapp.com https://www.google.com",
+  "worker-src 'self' blob:",
+  "manifest-src 'self'",
+  "media-src 'self' blob:",
+  "upgrade-insecure-requests",
+].join('; ');
+
+/**
+ * Security headers for every API and static response. The hosting config
+ * (vercel.json) mirrors these so Vercel's static CDN gets the same treatment.
+ */
+export const securityHeaders: RequestHandler = (req, res, next) => {
+  res.setHeader('Content-Security-Policy', CONTENT_SECURITY_POLICY);
+  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('X-XSS-Protection', '0');
+  res.setHeader('X-DNS-Prefetch-Control', 'off');
+  res.setHeader('X-Download-Options', 'noopen');
+  res.setHeader('X-Permitted-Cross-Domain-Policies', 'none');
+  res.setHeader('Origin-Agent-Cluster', '?1');
+  res.setHeader('Cross-Origin-Opener-Policy', 'same-origin-allow-popups');
+  res.setHeader('Cross-Origin-Resource-Policy', 'same-origin');
+  res.setHeader(
+    'Permissions-Policy',
+    'camera=(), microphone=(), geolocation=(), payment=(), usb=(), magnetometer=(), gyroscope=(), accelerometer=(), display-capture=(), fullscreen=(self), screen-wake-lock=()'
+  );
+
+  if (isSecureRequest(req)) {
+    res.setHeader('Strict-Transport-Security', 'max-age=63072000; includeSubDomains');
+  }
+
+  next();
+};
 
 export function asyncRoute(handler: (req: Request, res: Response, next: NextFunction) => Promise<unknown>): RequestHandler {
   return (req, res, next) => { Promise.resolve(handler(req, res, next)).catch(next); };

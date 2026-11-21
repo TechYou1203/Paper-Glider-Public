@@ -211,7 +211,7 @@ export interface PlayerResponse {
 }
 
 export interface GuestAuthResponse extends PlayerResponse {
-  token: string;
+  // The session is carried by an HttpOnly cookie; no token is returned.
 }
 
 export interface ServerLeaderboardEntry {

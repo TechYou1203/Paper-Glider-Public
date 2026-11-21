@@ -28854,12 +28854,105 @@ var export_escapeIdentifier = ct.escapeIdentifier;
 var export_escapeLiteral = ct.escapeLiteral;
 var export_types = ct.types;
 
+// server/session.ts
+var SESSION_COOKIE_NAME = "pg_session";
+var SESSION_MAX_AGE_SECONDS = 60 * 60 * 24 * 365;
+function isSecureRequest(req) {
+  if (req.secure) return true;
+  const forwarded = req.headers["x-forwarded-proto"];
+  const proto = Array.isArray(forwarded) ? forwarded[0] : forwarded;
+  return proto?.split(",")[0]?.trim() === "https";
+}
+function cookieAttributes(req) {
+  const host = (req.headers.host || "").split(":")[0].toLowerCase();
+  const isLocal = host === "localhost" || host === "127.0.0.1" || host === "[::1]";
+  const secure = isSecureRequest(req) || process.env.NODE_ENV === "production" && !isLocal;
+  return ["Path=/", "HttpOnly", "SameSite=Lax", ...secure ? ["Secure"] : []].join("; ");
+}
+function readCookie(req, name2) {
+  const header = req.headers.cookie;
+  if (!header) return null;
+  for (const part of header.split(";")) {
+    const separator = part.indexOf("=");
+    if (separator <= 0) continue;
+    if (part.slice(0, separator).trim() !== name2) continue;
+    let value = part.slice(separator + 1).trim();
+    if (value.startsWith('"') && value.endsWith('"')) value = value.slice(1, -1);
+    try {
+      value = decodeURIComponent(value);
+    } catch {
+    }
+    return value || null;
+  }
+  return null;
+}
+function readSessionToken(req) {
+  const authHeader = req.headers.authorization;
+  if (typeof authHeader === "string" && authHeader.startsWith("Bearer ")) {
+    const bearer = authHeader.slice(7).trim();
+    if (bearer) return bearer;
+  }
+  return readCookie(req, SESSION_COOKIE_NAME);
+}
+function setSessionCookie(req, res, token) {
+  if (!token) return;
+  res.setHeader(
+    "Set-Cookie",
+    `${SESSION_COOKIE_NAME}=${encodeURIComponent(token)}; ${cookieAttributes(req)}; Max-Age=${SESSION_MAX_AGE_SECONDS}`
+  );
+}
+function clearSessionCookie(req, res) {
+  res.setHeader(
+    "Set-Cookie",
+    `${SESSION_COOKIE_NAME}=; ${cookieAttributes(req)}; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT`
+  );
+}
+
 // server/http.ts
 var HttpError = class extends Error {
   constructor(status, message) {
     super(message);
     this.status = status;
   }
+};
+var MTA_STS_POLICY = "version: STSv1\nmode: testing\nmax_age: 86400\n";
+var CONTENT_SECURITY_POLICY = [
+  "default-src 'self'",
+  "base-uri 'self'",
+  "object-src 'none'",
+  "frame-ancestors 'none'",
+  "form-action 'self'",
+  "script-src 'self' https://apis.google.com https://www.google.com https://www.gstatic.com",
+  "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
+  "font-src 'self' data: https://fonts.gstatic.com",
+  "img-src 'self' data: blob: https://*.googleusercontent.com https://*.gstatic.com https://www.google.com",
+  "connect-src 'self' https://*.googleapis.com https://*.firebaseio.com https://*.firebaseapp.com https://*.google.com",
+  "frame-src 'self' https://accounts.google.com https://*.firebaseapp.com https://www.google.com",
+  "worker-src 'self' blob:",
+  "manifest-src 'self'",
+  "media-src 'self' blob:",
+  "upgrade-insecure-requests"
+].join("; ");
+var securityHeaders = (req, res, next) => {
+  res.setHeader("Content-Security-Policy", CONTENT_SECURITY_POLICY);
+  res.setHeader("Referrer-Policy", "strict-origin-when-cross-origin");
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("X-Frame-Options", "DENY");
+  res.setHeader("X-XSS-Protection", "0");
+  res.setHeader("X-DNS-Prefetch-Control", "off");
+  res.setHeader("X-Download-Options", "noopen");
+  res.setHeader("X-Permitted-Cross-Domain-Policies", "none");
+  res.setHeader("Origin-Agent-Cluster", "?1");
+  res.setHeader("Cross-Origin-Opener-Policy", "same-origin-allow-popups");
+  res.setHeader("Cross-Origin-Resource-Policy", "same-origin");
+  res.setHeader(
+    "Permissions-Policy",
+    "camera=(), microphone=(), geolocation=(), payment=(), usb=(), magnetometer=(), gyroscope=(), accelerometer=(), display-capture=(), fullscreen=(self), screen-wake-lock=()"
+  );
+  if (isSecureRequest(req)) {
+    res.setHeader("Strict-Transport-Security", "max-age=63072000; includeSubDomains");
+  }
+  next();
 };
 function callsignValue(value) {
   if (typeof value !== "string" || !/^[\p{L}\p{N} _-]{1,20}$/u.test(value.trim())) {
@@ -42131,12 +42224,11 @@ async function verifyFirebaseIdToken(idToken) {
 
 // server/middleware/auth.ts
 async function authMiddleware(req, res, next) {
-  const authHeader = req.headers.authorization;
-  if (!authHeader || !authHeader.startsWith("Bearer ")) {
-    res.status(401).json({ error: "Missing or invalid authorization header" });
+  const token = readSessionToken(req);
+  if (!token) {
+    res.status(401).json({ error: "Missing or invalid session" });
     return;
   }
-  const token = authHeader.slice(7);
   try {
     const rows = await sql`
       SELECT id, callsign, equipped_skin, paperclips, unlocked_skins, sound_enabled, firebase_uid, email, auth_provider
@@ -42144,7 +42236,8 @@ async function authMiddleware(req, res, next) {
       WHERE guest_token = ${token}
     `;
     if (rows.length === 0) {
-      res.status(401).json({ error: "Invalid token" });
+      clearSessionCookie(req, res);
+      res.status(401).json({ error: "Invalid session" });
       return;
     }
     const player = rows[0];
@@ -42167,12 +42260,11 @@ async function authMiddleware(req, res, next) {
   }
 }
 async function optionalAuth(req, res, next) {
-  const authHeader = req.headers.authorization;
-  if (!authHeader || !authHeader.startsWith("Bearer ")) {
+  const token = readSessionToken(req);
+  if (!token) {
     next();
     return;
   }
-  const token = authHeader.slice(7);
   try {
     const rows = await sql`
       SELECT id, callsign, equipped_skin, paperclips, unlocked_skins, sound_enabled, firebase_uid, email, auth_provider
@@ -42193,6 +42285,8 @@ async function optionalAuth(req, res, next) {
         authProvider: player.auth_provider || "guest",
         isGuest: !player.firebase_uid && !player.email
       };
+    } else {
+      clearSessionCookie(req, res);
     }
   } catch (error2) {
     console.error("Optional auth middleware error:", error2);
@@ -42485,6 +42579,10 @@ async function refreshPlayerLeaderboard(playerId) {
 
 // server/routes/auth.ts
 var router = (0, import_express.Router)();
+router.use((_req, res, next) => {
+  res.setHeader("Cache-Control", "no-store");
+  next();
+});
 var MAX_CODE_ATTEMPTS = 5;
 var PLAYER_COLUMNS = `
   id, guest_token, callsign, equipped_skin, paperclips, unlocked_skins,
@@ -42526,8 +42624,8 @@ router.post("/guest", rateLimit(30), async (req, res) => {
       VALUES (${guestToken}, ${playerCallsign})
       RETURNING ${sql.unsafe(PLAYER_COLUMNS)}
     `;
+    setSessionCookie(req, res, guestToken);
     res.status(201).json({
-      token: guestToken,
       player: playerPayload(rows[0])
     });
   } catch (error2) {
@@ -42536,9 +42634,10 @@ router.post("/guest", rateLimit(30), async (req, res) => {
 });
 router.post("/login", rateLimit(120), async (req, res) => {
   try {
-    const { token } = req.body || {};
-    if (typeof token !== "string" || token.length < 8) {
-      res.status(400).json({ error: "Token is required" });
+    const bodyToken = typeof req.body?.token === "string" ? req.body.token.trim() : "";
+    const token = bodyToken || readSessionToken(req);
+    if (!token || token.length < 8) {
+      res.status(400).json({ error: "Session is required" });
       return;
     }
     const rows = await sql`
@@ -42547,12 +42646,31 @@ router.post("/login", rateLimit(120), async (req, res) => {
       WHERE guest_token = ${token}
     `;
     if (rows.length === 0) {
-      res.status(401).json({ error: "Invalid token" });
+      clearSessionCookie(req, res);
+      res.status(401).json({ error: "Invalid session" });
       return;
     }
+    setSessionCookie(req, res, token);
     res.json({ player: playerPayload(rows[0]) });
   } catch (error2) {
     errorResponse(res, error2, "Failed to log in");
+  }
+});
+router.post("/logout", rateLimit(30), optionalAuth, async (req, res) => {
+  try {
+    const token = readSessionToken(req);
+    if (token) {
+      await sql`
+        UPDATE players
+        SET guest_token = ${crypto9.randomUUID()}, updated_at = NOW()
+        WHERE guest_token = ${token}
+      `;
+    }
+  } catch (error2) {
+    console.error("Logout session rotation failed:", error2);
+  } finally {
+    clearSessionCookie(req, res);
+    res.json({ success: true });
   }
 });
 router.post("/sync-pilot", rateLimit(60), optionalAuth, async (req, res) => {
@@ -42671,7 +42789,8 @@ router.post("/sync-pilot", rateLimit(60), optionalAuth, async (req, res) => {
     await refreshPlayerLeaderboard(player.id).catch((error2) => {
       console.error("Leaderboard refresh after pilot sync failed:", error2);
     });
-    res.json({ token: player.guest_token, player: playerPayload(player) });
+    setSessionCookie(req, res, player.guest_token);
+    res.json({ player: playerPayload(player) });
   } catch (error2) {
     if (error2?.code === "23505") {
       res.status(409).json({ error: "This email or sign-in method is already linked to another pilot." });
@@ -42951,9 +43070,9 @@ router.post("/verify-code", rateLimit(20), optionalAuth, async (req, res) => {
     await refreshPlayerLeaderboard(player.id).catch((error2) => {
       console.error("Leaderboard refresh after email verification failed:", error2);
     });
+    setSessionCookie(req, res, player.guest_token);
     res.json({
       success: true,
-      token: player.guest_token,
       player: playerPayload(player)
     });
   } catch (error2) {
@@ -42984,6 +43103,7 @@ router.delete("/account", rateLimit(10), authMiddleware, async (req, res) => {
       await sql`DELETE FROM google_accounts WHERE LOWER(email) = LOWER(${account.email})`;
       await sql`DELETE FROM verification_codes WHERE LOWER(email) = LOWER(${account.email})`;
     }
+    clearSessionCookie(req, res);
     res.json({
       success: true,
       deletedCount: 1,
@@ -44566,6 +44686,7 @@ var inventory_default = router5;
 var app = (0, import_express6.default)();
 app.set("trust proxy", 1);
 app.disable("x-powered-by");
+app.use(securityHeaders);
 app.use((0, import_cors.default)());
 app.use(import_express6.default.json({ limit: "1mb" }));
 app.use((req, _res, next) => {
@@ -44592,7 +44713,12 @@ var handleHealth = async (_req, res) => {
     timestamp: (/* @__PURE__ */ new Date()).toISOString()
   });
 };
-app.get(["/health", "/api/health", "/api", "/"], handleHealth);
+app.get(["/health", "/api/health", "/api"], handleHealth);
+app.get("/.well-known/mta-sts.txt", (_req, res) => {
+  res.setHeader("Content-Type", "text/plain; charset=utf-8");
+  res.setHeader("Cache-Control", "public, max-age=3600");
+  res.send(MTA_STS_POLICY);
+});
 app.use(["/api/auth", "/auth"], auth_default);
 app.use(["/api/leaderboard", "/leaderboard"], leaderboard_default);
 app.use(["/api/flights", "/flights"], flights_default);

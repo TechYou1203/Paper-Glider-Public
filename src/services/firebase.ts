@@ -193,7 +193,7 @@ interface LocalUserRecord {
   uid: string;
   username: string;
   email: string;
-  passwordHash: string;
+  provider?: 'password' | 'google' | 'otp' | 'local';
   paperclips: number;
   highScore: number;
   equippedSkin: string;
@@ -201,10 +201,80 @@ interface LocalUserRecord {
   createdAt: string;
 }
 
+type StoredLocalUserRecord = Partial<LocalUserRecord> & Record<string, unknown>;
+
+const LOCAL_USER_FIELDS = new Set([
+  'uid',
+  'username',
+  'email',
+  'provider',
+  'paperclips',
+  'highScore',
+  'equippedSkin',
+  'unlockedSkins',
+  'createdAt',
+]);
+
+function normalizeLocalUser(key: string, value: unknown): LocalUserRecord | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const record = value as StoredLocalUserRecord;
+  const provider =
+    record.provider === 'google' || record.provider === 'password' || record.provider === 'otp' || record.provider === 'local'
+      ? record.provider
+      : 'local';
+
+  return {
+    uid: typeof record.uid === 'string' && record.uid ? record.uid : `local-${key}`,
+    username: typeof record.username === 'string' && record.username ? record.username : key,
+    email: typeof record.email === 'string' ? record.email : '',
+    provider,
+    paperclips:
+      typeof record.paperclips === 'number' && Number.isFinite(record.paperclips) ? record.paperclips : 0,
+    highScore:
+      typeof record.highScore === 'number' && Number.isFinite(record.highScore) ? record.highScore : 0,
+    equippedSkin: typeof record.equippedSkin === 'string' ? record.equippedSkin : 'classic',
+    unlockedSkins:
+      Array.isArray(record.unlockedSkins) && record.unlockedSkins.length > 0
+        ? record.unlockedSkins.filter((skin): skin is string => typeof skin === 'string')
+        : ['classic'],
+    createdAt: typeof record.createdAt === 'string' ? record.createdAt : new Date().toISOString(),
+  };
+}
+
 function getLocalUsers(): Record<string, LocalUserRecord> {
   try {
     const raw = safeGetItem(LOCAL_USERS_KEY);
-    return raw ? JSON.parse(raw) : {};
+    if (!raw) return {};
+
+    const parsed = JSON.parse(raw) as unknown;
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      safeRemoveItem(LOCAL_USERS_KEY);
+      return {};
+    }
+
+    const users: Record<string, LocalUserRecord> = {};
+    let removedSecret = false;
+
+    for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
+      const user = normalizeLocalUser(key, value);
+      if (!user) {
+        removedSecret = true;
+        continue;
+      }
+      // Rewrite records that contain any field outside the public profile
+      // allow-list. Older releases kept credential material in this registry;
+      // dropping unknown fields removes it without ever writing it back.
+      const stored = value as StoredLocalUserRecord;
+      if (Object.keys(stored).some((field) => !LOCAL_USER_FIELDS.has(field))) {
+        removedSecret = true;
+      }
+      users[key] = user;
+    }
+
+    // Rewrite the registry immediately so legacy credential material cannot
+    // survive in the browser.
+    if (removedSecret) saveLocalUsers(users);
+    return users;
   } catch {
     return {};
   }
@@ -212,9 +282,28 @@ function getLocalUsers(): Record<string, LocalUserRecord> {
 
 function saveLocalUsers(users: Record<string, LocalUserRecord>) {
   try {
-    safeSetItem(LOCAL_USERS_KEY, JSON.stringify(users));
+    const safeUsers: Record<string, LocalUserRecord> = {};
+    for (const [key, user] of Object.entries(users)) {
+      // Explicit allow-list: never let a password hash or password leak back
+      // into browser storage through a spread or an old caller.
+      safeUsers[key] = {
+        uid: user.uid,
+        username: user.username,
+        email: user.email,
+        provider: user.provider,
+        paperclips: user.paperclips,
+        highScore: user.highScore,
+        equippedSkin: user.equippedSkin,
+        unlockedSkins: user.unlockedSkins,
+        createdAt: user.createdAt,
+      };
+    }
+    safeSetItem(LOCAL_USERS_KEY, JSON.stringify(safeUsers));
   } catch {}
 }
+
+// Scrub legacy credential material as soon as the application loads.
+getLocalUsers();
 
 // ─── Google Registered Accounts Registry ─────────────────────────────────────
 
@@ -249,13 +338,13 @@ export async function isGoogleRegisteredEmail(identifier: string): Promise<boole
   const recorded = getRecordedGoogleEmails();
   if (recorded.includes(norm)) return true;
 
-  // 2. Check local users registry (Google users have blank passwordHash)
+  // 2. Check local users registry (Google users are tagged by provider)
   const localUsers = getLocalUsers();
   for (const key in localUsers) {
     const u = localUsers[key];
     if (
       (u.email?.toLowerCase() === norm || u.username?.toLowerCase() === norm) &&
-      u.passwordHash === ''
+      u.provider === 'google'
     ) {
       return true;
     }
@@ -355,7 +444,13 @@ export async function completeVerifiedEmailAuth(
   const trimmedUser = username.trim();
   const trimmedEmail = email.trim().toLowerCase();
   const norm = normalizeUsername(trimmedUser);
-  const pass = password || `pilot_${norm}_pg2026!`;
+  // Email OTP sign-in is server-authoritative. If no password was chosen, the
+  // Firebase account receives a random password that is never stored anywhere;
+  // the pilot signs in with a fresh email code next time.
+  const pass =
+    password && password.length >= 6
+      ? password
+      : `pg_${crypto.randomUUID()}_${Date.now()}!`;
 
   // Disallow if this account is registered with Google
   const isGoogle = await isGoogleRegisteredEmail(trimmedEmail);
@@ -434,7 +529,7 @@ export async function completeVerifiedEmailAuth(
     uid,
     username: trimmedUser,
     email: trimmedEmail,
-    passwordHash: pass,
+    provider: 'otp',
     paperclips: localUsers[norm]?.paperclips || 0,
     highScore: localUsers[norm]?.highScore || 0,
     equippedSkin: localUsers[norm]?.equippedSkin || 'classic',
@@ -540,7 +635,7 @@ export async function registerWithUsername(
         uid: user.uid,
         username: trimmedUser,
         email: effectiveEmail,
-        passwordHash: btoa(password),
+        provider: 'password',
         paperclips: 0,
         highScore: 0,
         equippedSkin: 'classic',
@@ -566,7 +661,7 @@ export async function registerWithUsername(
     uid,
     username: trimmedUser,
     email: effectiveEmail,
-    passwordHash: btoa(password),
+    provider: 'local',
     paperclips: 0,
     highScore: 0,
     equippedSkin: 'classic',
@@ -723,19 +818,18 @@ export async function loginWithUsername(
     return { success: false, error: 'Username or email not found. Please register an account.' };
   }
 
-  if (record.passwordHash === '') {
+  if (record.provider === 'google') {
     return {
       success: false,
       error: 'This account is registered with Google. Try signing in with Google.',
     };
   }
 
-  if (record.passwordHash !== btoa(password)) {
-    return { success: false, error: 'Incorrect password. Please try again.' };
-  }
-
-  // Local password auth does not prove ownership to the Neon API. Clear any
-  // previous bearer token instead of silently reusing another account's row.
+  // Local fallback profiles are a convenience for environments without
+  // Firebase. No password verifier is stored in the browser, so this path can
+  // only select a non-authoritative local profile; it never grants a Neon
+  // session, rank, currency, or inventory. Production accounts authenticate
+  // through Firebase or the email OTP endpoint above.
   clearToken();
 
   const pilotUser: PilotUser = {
@@ -926,7 +1020,7 @@ export async function completeGoogleRegistration(
     uid,
     username: trimmed,
     email: effectiveEmail,
-    passwordHash: '',
+    provider: 'google',
     paperclips: localUsers[norm]?.paperclips ?? 0,
     highScore: localUsers[norm]?.highScore ?? 0,
     equippedSkin: localUsers[norm]?.equippedSkin ?? 'classic',
@@ -1359,14 +1453,36 @@ export async function loadCloudStats(uid: string): Promise<Partial<UserStats> | 
 
 function saveCurrentSession(user: PilotUser) {
   try {
-    safeSetItem(LOCAL_CURRENT_USER_KEY, JSON.stringify(user));
+    // Store only the public profile fields. Credentials and session tokens are
+    // never written to browser storage.
+    const session: PilotUser = {
+      uid: user.uid,
+      username: user.username,
+      email: user.email,
+      ...(user.photoURL ? { photoURL: user.photoURL } : {}),
+    };
+    safeSetItem(LOCAL_CURRENT_USER_KEY, JSON.stringify(session));
   } catch {}
 }
 
 export function getCurrentSession(): PilotUser | null {
   try {
     const raw = safeGetItem(LOCAL_CURRENT_USER_KEY);
-    return raw ? JSON.parse(raw) : null;
+    if (!raw) return null;
+
+    const parsed = JSON.parse(raw) as Partial<PilotUser> | null;
+    if (!parsed || typeof parsed.uid !== 'string' || !parsed.uid) {
+      safeRemoveItem(LOCAL_CURRENT_USER_KEY);
+      return null;
+    }
+    const username =
+      typeof parsed.username === 'string' && parsed.username ? parsed.username : 'Pilot';
+    return {
+      uid: parsed.uid,
+      username,
+      ...(typeof parsed.email === 'string' ? { email: parsed.email } : {}),
+      ...(typeof parsed.photoURL === 'string' ? { photoURL: parsed.photoURL } : {}),
+    };
   } catch {
     return null;
   }

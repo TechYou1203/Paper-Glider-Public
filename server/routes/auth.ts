@@ -6,8 +6,16 @@ import { verifyFirebaseIdToken } from '../firebaseAuth.js';
 import { authMiddleware, optionalAuth, AuthenticatedRequest } from '../middleware/auth.js';
 import { refreshPlayerLeaderboard } from '../ranking.js';
 import { callsignValue, HttpError, rateLimit } from '../http.js';
+import { clearSessionCookie, readSessionToken, setSessionCookie } from '../session.js';
 
 const router = Router();
+
+// Auth payloads contain session state and personal identifiers. Never allow a
+// browser, proxy or CDN to cache them.
+router.use((_req, res, next) => {
+  res.setHeader('Cache-Control', 'no-store');
+  next();
+});
 
 const MAX_CODE_ATTEMPTS = 5;
 
@@ -60,8 +68,8 @@ router.post('/guest', rateLimit(30), async (req, res: Response) => {
       RETURNING ${sql.unsafe(PLAYER_COLUMNS)}
     `;
 
+    setSessionCookie(req, res, guestToken);
     res.status(201).json({
-      token: guestToken,
       player: playerPayload(rows[0]),
     });
   } catch (error) {
@@ -69,13 +77,15 @@ router.post('/guest', rateLimit(30), async (req, res: Response) => {
   }
 });
 
-// POST /api/auth/login — Log in with an existing guest token
+// POST /api/auth/login — Restore the pilot session held in the HttpOnly cookie
+// (or adopt a legacy bearer token exactly once during the upgrade).
 router.post('/login', rateLimit(120), async (req, res: Response) => {
   try {
-    const { token } = req.body || {};
+    const bodyToken = typeof req.body?.token === 'string' ? req.body.token.trim() : '';
+    const token = bodyToken || readSessionToken(req);
 
-    if (typeof token !== 'string' || token.length < 8) {
-      res.status(400).json({ error: 'Token is required' });
+    if (!token || token.length < 8) {
+      res.status(400).json({ error: 'Session is required' });
       return;
     }
 
@@ -86,13 +96,35 @@ router.post('/login', rateLimit(120), async (req, res: Response) => {
     `;
 
     if (rows.length === 0) {
-      res.status(401).json({ error: 'Invalid token' });
+      clearSessionCookie(req, res);
+      res.status(401).json({ error: 'Invalid session' });
       return;
     }
 
+    setSessionCookie(req, res, token);
     res.json({ player: playerPayload(rows[0]) });
   } catch (error) {
     errorResponse(res, error, 'Failed to log in');
+  }
+});
+
+// POST /api/auth/logout — Rotate the token so a copied value cannot be replayed
+// after logout, then expire the browser cookie.
+router.post('/logout', rateLimit(30), optionalAuth, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const token = readSessionToken(req);
+    if (token) {
+      await sql`
+        UPDATE players
+        SET guest_token = ${crypto.randomUUID()}, updated_at = NOW()
+        WHERE guest_token = ${token}
+      `;
+    }
+  } catch (error) {
+    console.error('Logout session rotation failed:', error);
+  } finally {
+    clearSessionCookie(req, res);
+    res.json({ success: true });
   }
 });
 
@@ -241,7 +273,8 @@ router.post('/sync-pilot', rateLimit(60), optionalAuth, async (req: Authenticate
       console.error('Leaderboard refresh after pilot sync failed:', error);
     });
 
-    res.json({ token: player.guest_token, player: playerPayload(player) });
+    setSessionCookie(req, res, player.guest_token);
+    res.json({ player: playerPayload(player) });
   } catch (error: any) {
     if (error?.code === '23505') {
       res.status(409).json({ error: 'This email or sign-in method is already linked to another pilot.' });
@@ -587,9 +620,9 @@ router.post('/verify-code', rateLimit(20), optionalAuth, async (req: Authenticat
       console.error('Leaderboard refresh after email verification failed:', error);
     });
 
+    setSessionCookie(req, res, player.guest_token);
     res.json({
       success: true,
-      token: player.guest_token,
       player: playerPayload(player),
     });
   } catch (error: any) {
@@ -626,6 +659,7 @@ router.delete('/account', rateLimit(10), authMiddleware, async (req: Authenticat
       await sql`DELETE FROM verification_codes WHERE LOWER(email) = LOWER(${account.email})`;
     }
 
+    clearSessionCookie(req, res);
     res.json({
       success: true,
       deletedCount: 1,

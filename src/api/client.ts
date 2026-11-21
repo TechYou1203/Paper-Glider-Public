@@ -1,6 +1,10 @@
 /**
  * API client for Paper Glider backend.
- * Falls back to localStorage when the server is unavailable.
+ * Falls back to localStorage for local game stats when the server is unavailable.
+ *
+ * Authentication is carried by the server's HttpOnly session cookie. A legacy
+ * bearer token is read once so existing pilots survive the upgrade, then it is
+ * deleted from localStorage immediately.
  */
 
 import type {
@@ -14,7 +18,7 @@ import type {
 } from '../game/types';
 
 const API_BASE = typeof window !== 'undefined' ? '/api' : 'http://localhost:3001/api';
-const TOKEN_KEY = 'paper_glider_auth_token';
+const LEGACY_TOKEN_KEY = 'paper_glider_auth_token';
 const REQUEST_TIMEOUT_MS = 15_000;
 
 /**
@@ -24,11 +28,25 @@ const REQUEST_TIMEOUT_MS = 15_000;
 function fetchWithTimeout(input: RequestInfo | URL, init: RequestInit = {}): Promise<Response> {
   return fetch(input, {
     ...init,
+    credentials: init.credentials ?? 'same-origin',
     signal: init.signal ?? AbortSignal.timeout(REQUEST_TIMEOUT_MS),
   });
 }
 
-let cachedToken: string | null = null;
+function takeLegacyToken(): string | null {
+  if (typeof localStorage === 'undefined') return null;
+  try {
+    const token = localStorage.getItem(LEGACY_TOKEN_KEY);
+    if (token) localStorage.removeItem(LEGACY_TOKEN_KEY);
+    return token;
+  } catch {
+    return null;
+  }
+}
+
+// Keep a legacy token only in memory for the one request that migrates it into
+// an HttpOnly cookie. Never write session material back to browser storage.
+let cachedToken: string | null = takeLegacyToken();
 let serverOnline: boolean | null = null;
 
 type StatusListener = (online: boolean) => void;
@@ -60,24 +78,15 @@ function updateServerStatus(online: boolean) {
 // ─── Helpers ────────────────────────────────────────────────
 
 export function getToken(): string | null {
-  if (cachedToken) return cachedToken;
-  if (typeof localStorage !== 'undefined') {
-    cachedToken = localStorage.getItem(TOKEN_KEY);
-  }
   return cachedToken;
-}
-
-export function setToken(token: string) {
-  cachedToken = token;
-  if (typeof localStorage !== 'undefined') {
-    localStorage.setItem(TOKEN_KEY, token);
-  }
 }
 
 export function clearToken() {
   cachedToken = null;
   if (typeof localStorage !== 'undefined') {
-    localStorage.removeItem(TOKEN_KEY);
+    try {
+      localStorage.removeItem(LEGACY_TOKEN_KEY);
+    } catch {}
   }
 }
 
@@ -173,8 +182,10 @@ export async function registerGuest(callsign?: string): Promise<ServerPlayer | n
     });
     if (!res.ok) return null;
     const data = await res.json().catch(() => null);
-    if (data?.token) {
-      setToken(data.token);
+    if (data?.player) {
+      // The new guest cookie is authoritative; never keep a legacy bearer token
+      // that could override it on the next request.
+      clearToken();
       updateServerStatus(true);
       return data.player;
     }
@@ -198,21 +209,22 @@ export interface TokenSessionResult {
  * network failure must never replace a pilot with a fresh guest account.
  */
 export async function loginWithTokenDetailed(): Promise<TokenSessionResult> {
+  // The cookie is HttpOnly, so JavaScript cannot inspect it. Always ask the
+  // server, sending a legacy bearer token only while migrating an old install.
   const token = getToken();
-  if (!token) return { player: null, invalid: true, reachable: true };
 
   try {
     const res = await fetchWithTimeout(`${API_BASE}/auth/login`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        Authorization: `Bearer ${token}`,
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
       },
-      body: JSON.stringify({ token }),
+      body: JSON.stringify(token ? { token } : {}),
     });
     updateServerStatus(true);
 
-    if (res.status === 401) {
+    if (res.status === 400 || res.status === 401) {
       clearToken();
       return { player: null, invalid: true, reachable: true };
     }
@@ -221,6 +233,8 @@ export async function loginWithTokenDetailed(): Promise<TokenSessionResult> {
     }
     const data = await res.json().catch(() => null);
     if (data?.player) {
+      // The HttpOnly cookie now owns the session; drop the legacy in-memory copy.
+      clearToken();
       return { player: data.player, invalid: false, reachable: true };
     }
     return { player: null, invalid: false, reachable: true };
@@ -361,12 +375,13 @@ export async function syncPilotAccount(
   authProvider?: string,
   idToken?: string
 ): Promise<ServerPlayer | null> {
-  const data = await apiFetch<{ token: string; player: ServerPlayer }>('/auth/sync-pilot', {
+  const data = await apiFetch<{ player: ServerPlayer }>('/auth/sync-pilot', {
     method: 'POST',
     body: JSON.stringify({ firebaseUid, callsign, email, authProvider, idToken }),
   });
-  if (data?.token) {
-    setToken(data.token);
+  if (data?.player) {
+    // The server set an HttpOnly cookie; a legacy bearer token is no longer needed.
+    clearToken();
     updateServerStatus(true);
     return data.player;
   }
@@ -416,6 +431,23 @@ export async function deleteServerAccount(): Promise<boolean> {
 }
 
 /**
+ * Ask the server to rotate and expire the HttpOnly session cookie.
+ */
+export async function logoutServerSession(): Promise<void> {
+  try {
+    await fetchWithTimeout(`${API_BASE}/auth/logout`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: '{}',
+    });
+  } catch (err) {
+    console.warn('Server logout failed:', err);
+  } finally {
+    clearToken();
+  }
+}
+
+/**
  * Send 6-digit email verification code with username validation.
  */
 export async function sendVerificationCode(
@@ -460,7 +492,6 @@ export async function verifyAuthCode(
   type: 'signup' | 'login' = 'signup'
 ): Promise<{
   success: boolean;
-  token?: string;
   player?: ServerPlayer;
   error?: string;
 }> {
@@ -474,13 +505,12 @@ export async function verifyAuthCode(
     if (!res.ok) {
       return { success: false, error: data?.error || 'Invalid verification code.' };
     }
-    if (data.token) {
-      setToken(data.token);
-      updateServerStatus(true);
-    }
+    // The server just issued the HttpOnly session cookie. Drop any legacy
+    // bearer token so it cannot take precedence over the new session.
+    clearToken();
+    updateServerStatus(true);
     return {
       success: true,
-      token: data.token,
       player: data.player,
     };
   } catch (err: any) {
